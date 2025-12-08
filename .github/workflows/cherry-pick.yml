@@ -14,7 +14,7 @@ permissions:
   contents: write
   pull-requests: write
 
-run-name: Cherry-pick ${{ github.event.pull_request.merge_commit_sha }} from ${{ github.event.pull_request.head.ref }} to UAT
+run-name: Cherry-pick ${{ github.event.pull_request.merge_commit_sha }} from ${{ github.event.pull_request.base.ref }} to uat
 
 jobs:
   cherry-pick-to-uat:
