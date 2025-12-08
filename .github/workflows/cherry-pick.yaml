@@ -1,0 +1,98 @@
+name: Cherry-pick to UAT
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+concurrency:
+  group: cherry-pick-uat-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  cherry-pick-to-uat:
+    if: |
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name '${{ github.event.pull_request.user.name }}'
+          git config --global user.email '${{ github.event.pull_request.user.email }}'
+
+      - name: Get merged commit hash
+        id: commit-hash
+        run: echo "hash=${{ github.event.pull_request.merge_commit_sha }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout UAT branch
+        run: |
+          git fetch origin uat:uat
+          git checkout uat
+          git pull origin uat
+
+      - name: Cherry-pick commit
+        id: cherry-pick
+        run: |
+          if git cherry-pick ${{ steps.commit-hash.outputs.hash }}; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Cherry-pick successful"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "Cherry-pick failed, attempting to resolve conflicts"
+            
+            # Check if there are conflicts
+            if git status --porcelain | grep -q "^UU"; then
+              echo "Conflicts detected, aborting cherry-pick"
+              git cherry-pick --abort
+              exit 1
+            else
+              echo "No conflicts, continuing"
+            fi
+          fi
+
+      - name: Push to UAT branch
+        if: steps.cherry-pick.outputs.status == 'success'
+        run: |
+          git push origin uat
+
+      - name: Create comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo, number } = context.issue;
+            const commitHash = '${{ steps.commit-hash.outputs.hash }}';
+            const status = '${{ steps.cherry-pick.outputs.status }}';
+
+            let comment = '';
+            if (status === 'success') {
+              comment = `✅ **Auto Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been automatically cherry-picked to the \`uat\` branch.`;
+            } else {
+              comment = `❌ **Auto Cherry-pick Failed**\n\nFailed to automatically cherry-pick commit \`${commitHash}\` to the \`uat\` branch. Manual intervention may be required.`;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: number,
+              body: comment
+            });
+
+      - name: Handle cherry-pick failure
+        if: steps.cherry-pick.outputs.status == 'failed'
+        run: |
+          echo "Cherry-pick failed for commit ${{ steps.commit-hash.outputs.hash }}"
+          echo "Manual cherry-pick may be required"
+          exit 1
