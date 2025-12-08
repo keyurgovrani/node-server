@@ -1,7 +1,7 @@
 name: Cherry-pick to UAT
 
 on:
-  pull_request_target:
+  pull_request:
     types: [closed]
     branches:
       - main
@@ -13,7 +13,6 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 jobs:
   cherry-pick-to-uat:
@@ -30,8 +29,8 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com"
 
       - name: Get merged commit hash
         id: commit-hash
