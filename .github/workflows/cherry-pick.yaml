@@ -1,7 +1,7 @@
 name: Cherry-pick to UAT
 
 on:
-  pull_request_target:
+  pull_request:
     types: [closed]
     branches:
       - main
@@ -13,7 +13,6 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 jobs:
   cherry-pick-to-uat:
