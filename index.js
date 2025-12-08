@@ -10,7 +10,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Basic GET route
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
 	res.json({ message: "Server is running!" });
 });
 
