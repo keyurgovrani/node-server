@@ -14,6 +14,8 @@ permissions:
   contents: write
   pull-requests: write
 
+run-name: Cherry-pick ${{ github.event.pull_request.merge_commit_sha }} from ${{ github.event.pull_request.head.ref }} to UAT
+
 jobs:
   cherry-pick-to-uat:
     if: |
@@ -45,21 +47,36 @@ jobs:
       - name: Cherry-pick commit
         id: cherry-pick
         run: |
-          if git cherry-pick ${{ steps.commit-hash.outputs.hash }}; then
+          COMMIT=${{ steps.commit-hash.outputs.hash }}
+
+          # Detect number of parents
+          PARENT_COUNT=$(git rev-list --parents -n 1 $COMMIT | wc -w)
+          # Explanation:
+          # 2 words = normal commit (sha parent)
+          # 3 words = merge commit (sha parent1 parent2)
+
+          if [ "$PARENT_COUNT" -gt 2 ]; then
+            echo "Merge commit detected → using -m 1"
+            PICK_CMD="git cherry-pick -m 1 $COMMIT"
+          else
+            echo "Normal commit detected → standard cherry-pick"
+            PICK_CMD="git cherry-pick $COMMIT"
+          fi
+
+          echo "Running: $PICK_CMD"
+          if $PICK_CMD; then
             echo "status=success" >> $GITHUB_OUTPUT
             echo "Cherry-pick successful"
           else
             echo "status=failed" >> $GITHUB_OUTPUT
-            echo "Cherry-pick failed, attempting to resolve conflicts"
-            
-            # Check if there are conflicts
+            echo "Cherry-pick failed, checking for conflicts..."
+
             if git status --porcelain | grep -q "^UU"; then
-              echo "Conflicts detected, aborting cherry-pick"
+              echo "Conflicts detected → aborting cherry-pick"
               git cherry-pick --abort
-              exit 1
-            else
-              echo "No conflicts, continuing"
             fi
+
+            exit 1
           fi
 
       - name: Push to UAT branch

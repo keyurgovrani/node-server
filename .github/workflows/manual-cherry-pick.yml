@@ -1,5 +1,7 @@
 name: Manual Cherry-pick
 
+run-name: Cherry-pick ${{ github.event.inputs.commit-hash }} from ${{ github.ref_name }} to ${{ github.event.inputs.dest-branch-choice == 'custom' && github.event.inputs.custom-dest-branch || github.event.inputs.dest-branch-choice }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -26,7 +28,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
 
 jobs:
   manual-cherry-pick:
@@ -58,8 +59,8 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
 
       - name: Validate destination branch exists
         run: |
@@ -82,7 +83,20 @@ jobs:
       - name: Cherry-pick commit
         id: cherry
         run: |
-          if git cherry-pick ${{ github.event.inputs.commit-hash }}; then
+          COMMIT="${{ github.event.inputs.commit-hash }}"
+
+          # Count parents — merge commits have 2 parents
+          PARENT_COUNT=$(git show --pretty=%P -s $COMMIT | wc -w)
+
+          if [ "$PARENT_COUNT" -gt 1 ]; then
+            echo "Merge commit detected → using: git cherry-pick -m 1 $COMMIT"
+            PICK_CMD="git cherry-pick -m 1 $COMMIT"
+          else
+            echo "Normal commit → using: git cherry-pick $COMMIT"
+            PICK_CMD="git cherry-pick $COMMIT"
+          fi
+
+          if $PICK_CMD; then
             echo "status=success" >> $GITHUB_OUTPUT
             echo "Cherry-pick successful"
           else
@@ -93,6 +107,7 @@ jobs:
               echo "Conflicts detected → aborting"
               git cherry-pick --abort
             fi
+
             exit 1
           fi
 
@@ -109,7 +124,9 @@ jobs:
             const { owner, repo } = context.repo;
 
             const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner, repo, commit_sha: commit
+              owner,
+              repo,
+              commit_sha: commit
             });
 
             core.setOutput("pr", prs.data[0]?.number ?? "");
@@ -122,14 +139,22 @@ jobs:
             const pr = ${{ steps.prlookup.outputs.pr }};
             const { owner, repo } = context.repo;
             const dest = "${{ steps.branch.outputs.DEST }}";
+            const commitHash = "${{ github.event.inputs.commit-hash }}";
+            const status = "${{ steps.cherry.outputs.status }}";
 
-            const msg =
-              ${{ steps.cherry.outputs.status == 'success' }}
-                ? `✅ **Cherry-pick Successful**\nCommit was cherry-picked into \`${dest}\`.`
-                : `❌ **Cherry-pick Failed**\nConflict occurred cherry-picking into \`${dest}\`. Manual resolution required.`;
+            let comment = '';
+
+            if (status === "success") {
+                comment = `✅ **Manual Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been manually cherry-picked into the \`${dest}\` branch.`;
+            } else {
+                comment = `❌ **Manual Cherry-pick Failed**\n\nFailed to manually cherry-pick commit \`${commitHash}\` into the \`${dest}\` branch due to conflicts. Manual intervention may be required.`;
+            }
 
             await github.rest.issues.createComment({
-              owner, repo, issue_number: pr, body: msg
+                owner,
+                repo,
+                issue_number: pr,
+                body: comment
             });
 
       - name: No PR found
