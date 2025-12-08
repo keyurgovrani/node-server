@@ -95,9 +95,9 @@ jobs:
 
             let comment = '';
             if (status === 'success') {
-              comment = `✅ **Auto Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been automatically cherry-picked to the \`uat\` branch.`;
+              comment = `✅ **Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been cherry-picked to the \`uat\` branch.`;
             } else {
-              comment = `❌ **Auto Cherry-pick Failed**\n\nFailed to automatically cherry-pick commit \`${commitHash}\` to the \`uat\` branch. Manual intervention may be required.`;
+              comment = `❌ **Cherry-pick Failed**\n\nFailed to cherry-pick commit \`${commitHash}\` to the \`uat\` branch. Manual intervention may be required.`;
             }
 
             await github.rest.issues.createComment({

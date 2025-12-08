@@ -35,20 +35,33 @@ jobs:
 
     steps:
 
+      - name: Set workflow variables
+        id: vars
+        run: |
+          COMMIT_HASH=$(echo "${{ github.event.inputs.commit-hash }}" | xargs)
+          DEST_BRANCH_CHOICE=$(echo "${{ github.event.inputs.dest-branch-choice }}" | xargs)
+          CUSTOM_DEST_BRANCH=$(echo "${{ github.event.inputs.custom-dest-branch }}" | xargs)
+          REF_NAME=$(echo "${{ github.ref_name }}" | xargs)
+          
+          echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "DEST_BRANCH_CHOICE=$DEST_BRANCH_CHOICE" >> $GITHUB_OUTPUT
+          echo "CUSTOM_DEST_BRANCH=$CUSTOM_DEST_BRANCH" >> $GITHUB_OUTPUT
+          echo "REF_NAME=$REF_NAME" >> $GITHUB_OUTPUT
+
       - name: Determine destination branch
         id: branch
         run: |
-          if [[ "${{ github.event.inputs.dest-branch-choice }}" == "custom" ]]; then
-            if [[ -z "${{ github.event.inputs.custom-dest-branch }}" ]]; then
+          if [[ "${{ steps.vars.outputs.DEST_BRANCH_CHOICE }}" == "custom" ]]; then
+            if [[ -z "${{ steps.vars.outputs.CUSTOM_DEST_BRANCH }}" ]]; then
               echo "Custom branch option selected but no custom branch provided."
               exit 1
             fi
-            echo "DEST=${{ github.event.inputs.custom-dest-branch }}" >> $GITHUB_OUTPUT
+            echo "DEST=${{ steps.vars.outputs.CUSTOM_DEST_BRANCH }}" >> $GITHUB_OUTPUT
           else
-            echo "DEST=${{ github.event.inputs.dest-branch-choice }}" >> $GITHUB_OUTPUT
+            echo "DEST=${{ steps.vars.outputs.DEST_BRANCH_CHOICE }}" >> $GITHUB_OUTPUT
           fi
 
-          echo "Base branch (workflow run branch): ${{ github.ref_name }}"
+          echo "Base branch (workflow run branch): ${{ steps.vars.outputs.REF_NAME }}"
           echo "Destination branch: $(echo $DEST)"
 
       - name: Checkout repo
@@ -81,9 +94,9 @@ jobs:
           git pull origin ${{ steps.branch.outputs.DEST }}
 
       - name: Cherry-pick commit
-        id: cherry
+        id: cherry-pick
         run: |
-          COMMIT="${{ github.event.inputs.commit-hash }}"
+          COMMIT="${{ steps.vars.outputs.COMMIT_HASH }}"
 
           # Count parents — merge commits have 2 parents
           PARENT_COUNT=$(git show --pretty=%P -s $COMMIT | wc -w)
@@ -112,15 +125,15 @@ jobs:
           fi
 
       - name: Push commit
-        if: steps.cherry.outputs.status == 'success'
+        if: steps.cherry-pick.outputs.status == 'success'
         run: git push origin ${{ steps.branch.outputs.DEST }}
 
       - name: Find PR associated with commit
-        id: prlookup
+        id: pr-lookup
         uses: actions/github-script@v7
         with:
           script: |
-            const commit = "${{ github.event.inputs.commit-hash }}".trim();
+            const commit = "${{ steps.vars.outputs.COMMIT_HASH }}";
             const { owner, repo } = context.repo;
 
             const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
@@ -132,22 +145,22 @@ jobs:
             core.setOutput("pr", prs.data[0]?.number ?? "");
 
       - name: Comment on PR (if found)
-        if: steps.prlookup.outputs.pr != ''
+        if: steps.pr-lookup.outputs.pr != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = ${{ steps.prlookup.outputs.pr }};
+            const pr = ${{ steps.pr-lookup.outputs.pr }};
             const { owner, repo } = context.repo;
             const dest = "${{ steps.branch.outputs.DEST }}";
-            const commitHash = "${{ github.event.inputs.commit-hash }}";
-            const status = "${{ steps.cherry.outputs.status }}";
+            const commitHash = "${{ steps.vars.outputs.COMMIT_HASH }}";
+            const status = "${{ steps.cherry-pick.outputs.status }}";
 
             let comment = '';
 
             if (status === "success") {
-                comment = `✅ **Manual Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been manually cherry-picked into the \`${dest}\` branch.`;
+                comment = `✅ **Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been cherry-picked into the \`${dest}\` branch.`;
             } else {
-                comment = `❌ **Manual Cherry-pick Failed**\n\nFailed to manually cherry-pick commit \`${commitHash}\` into the \`${dest}\` branch due to conflicts. Manual intervention may be required.`;
+                comment = `❌ **Cherry-pick Failed**\n\nFailed to cherry-pick commit \`${commitHash}\` into the \`${dest}\` branch due to conflicts. Manual intervention may be required.`;
             }
 
             await github.rest.issues.createComment({
@@ -158,9 +171,9 @@ jobs:
             });
 
       - name: No PR found
-        if: steps.prlookup.outputs.pr == ''
+        if: steps.pr-lookup.outputs.pr == ''
         run: echo "ℹ️ No PR found for commit."
 
       - name: Fail workflow if cherry-pick failed
-        if: steps.cherry.outputs.status == 'failed'
+        if: steps.cherry-pick.outputs.status == 'failed'
         run: exit 1
