@@ -120,7 +120,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const commit = "${{ github.event.inputs.commit-hash }}";
+            const commit = "${{ github.event.inputs.commit-hash }}".trim();
             const { owner, repo } = context.repo;
 
             const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
