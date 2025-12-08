@@ -1,0 +1,141 @@
+name: Manual Cherry-pick
+
+on:
+  workflow_dispatch:
+    inputs:
+      dest-branch-choice:
+        description: "Choose destination branch or select 'custom'"
+        required: true
+        type: choice
+        default: "uat"
+        options:
+          - uat
+          - live
+          - custom
+
+      custom-dest-branch:
+        description: "Enter custom destination branch name (if 'custom' selected)"
+        required: false
+        type: string
+
+      commit-hash:
+        description: "Commit hash to cherry-pick"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  manual-cherry-pick:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Determine destination branch
+        id: branch
+        run: |
+          if [[ "${{ github.event.inputs.dest-branch-choice }}" == "custom" ]]; then
+            if [[ -z "${{ github.event.inputs.custom-dest-branch }}" ]]; then
+              echo "Custom branch option selected but no custom branch provided."
+              exit 1
+            fi
+            echo "DEST=${{ github.event.inputs.custom-dest-branch }}" >> $GITHUB_OUTPUT
+          else
+            echo "DEST=${{ github.event.inputs.dest-branch-choice }}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Base branch (workflow run branch): ${{ github.ref_name }}"
+          echo "Destination branch: $(echo $DEST)"
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate destination branch exists
+        run: |
+          if git ls-remote --heads origin ${{ steps.branch.outputs.DEST }} \
+            | grep -q "${{ steps.branch.outputs.DEST }}"; then
+            echo "Destination branch exists."
+          else
+            echo "❌ Branch '${{ steps.branch.outputs.DEST }}' does not exist!"
+            exit 1
+          fi
+
+      - name: Fetch all branches
+        run: git fetch --all
+
+      - name: Checkout destination branch
+        run: |
+          git checkout ${{ steps.branch.outputs.DEST }}
+          git pull origin ${{ steps.branch.outputs.DEST }}
+
+      - name: Cherry-pick commit
+        id: cherry
+        run: |
+          if git cherry-pick ${{ github.event.inputs.commit-hash }}; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Cherry-pick successful"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "Cherry-pick failed"
+
+            if git status --porcelain | grep -q "^UU"; then
+              echo "Conflicts detected → aborting"
+              git cherry-pick --abort
+            fi
+            exit 1
+          fi
+
+      - name: Push commit
+        if: steps.cherry.outputs.status == 'success'
+        run: git push origin ${{ steps.branch.outputs.DEST }}
+
+      - name: Find PR associated with commit
+        id: prlookup
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commit = "${{ github.event.inputs.commit-hash }}";
+            const { owner, repo } = context.repo;
+
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: commit
+            });
+
+            core.setOutput("pr", prs.data[0]?.number ?? "");
+
+      - name: Comment on PR (if found)
+        if: steps.prlookup.outputs.pr != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = ${{ steps.prlookup.outputs.pr }};
+            const { owner, repo } = context.repo;
+            const dest = "${{ steps.branch.outputs.DEST }}";
+
+            const msg =
+              ${{ steps.cherry.outputs.status == 'success' }}
+                ? `✅ **Cherry-pick Successful**\nCommit was cherry-picked into \`${dest}\`.`
+                : `❌ **Cherry-pick Failed**\nConflict occurred cherry-picking into \`${dest}\`. Manual resolution required.`;
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: pr, body: msg
+            });
+
+      - name: No PR found
+        if: steps.prlookup.outputs.pr == ''
+        run: echo "ℹ️ No PR found for commit."
+
+      - name: Fail workflow if cherry-pick failed
+        if: steps.cherry.outputs.status == 'failed'
+        run: exit 1
