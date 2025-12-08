@@ -30,8 +30,8 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --global user.name '${{ github.event.pull_request.user.name }}'
-          git config --global user.email '${{ github.event.pull_request.user.email }}'
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Get merged commit hash
         id: commit-hash
