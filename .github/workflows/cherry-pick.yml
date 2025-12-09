@@ -1,28 +1,122 @@
-name: Cherry-pick to UAT
+name: Cherry-pick PR
 
 on:
+  workflow_dispatch:
+    inputs:
+      commit_hash:
+        description: "Commit hash to cherry-pick"
+        required: true
+        type: string
+
+      target_branch:
+        description: "Target branch for cherry-pick"
+        required: true
+        type: choice
+        default: "uat"
+        options:
+          - uat
+          - live
+          - custom
+
+      custom_target_branch:
+        description: "Custom target branch name (required if 'custom' selected)"
+        required: false
+        type: string
+
   pull_request:
     types: [closed]
     branches:
       - main
 
 concurrency:
-  group: cherry-pick-uat-${{ github.event.pull_request.number }}
+  # Concurrency group ensures only one cherry-pick operation runs at a time per PR or workflow run
+  # - For auto-triggered PRs: uses PR number to prevent concurrent cherry-picks of the same PR
+  # - For manual triggers: uses unique run_id since there's no PR number
+  # - cancel-in-progress: false ensures in-flight cherry-picks complete rather than being cancelled
+  group: cherry-pick-pr-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 permissions:
   contents: write
   pull-requests: write
 
-run-name: Cherry-pick ${{ github.event.pull_request.merge_commit_sha }} from ${{ github.event.pull_request.base.ref }} to uat
+# Dynamic run name that adapts based on how the workflow was triggered:
+# - Auto trigger (PR merge): "Cherry-pick {merge_commit_sha} to uat"
+# - Manual trigger with predefined branch: "Cherry-pick {commit_hash} to {uat|live}"
+# - Manual trigger with custom branch: "Cherry-pick {commit_hash} to {custom_branch_name}"
+run-name: ${{ github.event_name == 'pull_request' && format('Cherry-pick {0} to uat', github.event.pull_request.merge_commit_sha) || format('Cherry-pick {0} to {1}', github.event.inputs.commit_hash, github.event.inputs.target_branch == 'custom' && github.event.inputs.custom_target_branch || github.event.inputs.target_branch) }}
 
 jobs:
-  cherry-pick-to-uat:
+  cherry-pick:
     if: |
-      github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT')
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT')) ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
+      - name: Sanitize and set input variables
+        id: input-vars
+        run: |
+          # Determine source of inputs based on trigger type and set variables accordingly
+          # This branching logic handles two different event contexts with different data structures
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # AUTO TRIGGER PATH: PR merged with "Cherry-pick to UAT" label
+            # - COMMIT_HASH: merge commit SHA from the PR that was just merged
+            # - TARGET_BRANCH: hardcoded to "uat" (auto cherry-picks always go to UAT)
+            # - SOURCE_BRANCH: the base branch where PR was merged (typically "main")
+            # - PR_NUMBER: the PR number for commenting back on the original PR
+            # - TRIGGER_TYPE: tracks how workflow was triggered (for logging/commenting)
+            COMMIT_HASH="${{ github.event.pull_request.merge_commit_sha }}"
+            TARGET_BRANCH="uat"
+            CUSTOM_TARGET_BRANCH=""
+            SOURCE_BRANCH="${{ github.event.pull_request.base.ref }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            TRIGGER_TYPE="auto"
+          else
+            # MANUAL TRIGGER PATH: workflow_dispatch with user-provided inputs
+            # - COMMIT_HASH: user-provided commit SHA to cherry-pick
+            # - TARGET_BRANCH: user-selected branch (uat/live/custom)
+            # - CUSTOM_TARGET_BRANCH: user-provided custom branch name (if "custom" was selected)
+            # - SOURCE_BRANCH: the branch from which workflow was manually triggered
+            # - PR_NUMBER: empty (will attempt to find associated PR later)
+            # - xargs: trims whitespace from user inputs to prevent errors
+            COMMIT_HASH=$(echo "${{ github.event.inputs.commit_hash }}" | xargs)
+            TARGET_BRANCH=$(echo "${{ github.event.inputs.target_branch }}" | xargs)
+            CUSTOM_TARGET_BRANCH=$(echo "${{ github.event.inputs.custom_target_branch }}" | xargs)
+            SOURCE_BRANCH=$(echo "${{ github.ref_name }}" | xargs)
+            PR_NUMBER=""
+            TRIGGER_TYPE="manual"
+          fi
+          
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+          echo "custom_target_branch=$CUSTOM_TARGET_BRANCH" >> $GITHUB_OUTPUT
+          echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "trigger_type=$TRIGGER_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Determine target branch
+        id: resolved-target
+        run: |
+          # Resolve the actual target branch name for cherry-picking
+          # This handles the "custom" option where users can specify any branch name
+          if [[ "${{ steps.input-vars.outputs.target_branch }}" == "custom" ]]; then
+            # User selected "custom" option - validate that they provided a custom branch name
+            # Without this check, the workflow would fail later with unclear error
+            if [[ -z "${{ steps.input-vars.outputs.custom_target_branch }}" ]]; then
+              echo "❌ Custom branch option selected but no custom branch name provided."
+              exit 1
+            fi
+            # Use the custom branch name provided by user
+            echo "branch=${{ steps.input-vars.outputs.custom_target_branch }}" >> $GITHUB_OUTPUT
+          else
+            # User selected a predefined option (uat/live) or auto-trigger (always uat)
+            # Use the target_branch value directly
+            echo "branch=${{ steps.input-vars.outputs.target_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Source branch (workflow triggered from): ${{ steps.input-vars.outputs.source_branch }}"
+          echo "Target branch (cherry-pick destination): $(cat $GITHUB_OUTPUT | grep branch= | cut -d= -f2)"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -31,31 +125,56 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config --global user.name "${{ github.actor }}"
-          git config --global user.email "${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com"
+          # Set Git user identity for the cherry-pick commit
+          # Different event types have different data structures for user info
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # Auto trigger: use the original PR author's identity
+            # Format: user.id+user.login@users.noreply.github.com (GitHub's noreply email format)
+            git config --global user.name "${{ github.actor }}"
+            git config --global user.email "${{ github.event.pull_request.user.id }}+${{ github.event.pull_request.user.login }}@users.noreply.github.com"
+          else
+            # Manual trigger: use the person who manually triggered the workflow
+            # Format: actor_id+actor@users.noreply.github.com
+            git config --global user.name "${{ github.actor }}"
+            git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          fi
 
-      - name: Get merged commit hash
-        id: commit-hash
-        run: echo "hash=${{ github.event.pull_request.merge_commit_sha }}" >> $GITHUB_OUTPUT
-
-      - name: Checkout UAT branch
+      - name: Validate target branch exists
         run: |
-          git fetch origin uat:uat
-          git checkout uat
-          git pull origin uat
+          # Verify the target branch exists on remote before attempting cherry-pick
+          # This prevents wasting time on git operations that would fail later
+          # - git ls-remote: queries remote repository for branch refs
+          # - grep -q: silently checks if branch name appears in output
+          # - Early exit prevents confusing error messages from git checkout/cherry-pick
+          if git ls-remote --heads origin ${{ steps.resolved-target.outputs.branch }} \
+            | grep -q "${{ steps.resolved-target.outputs.branch }}"; then
+            echo "✅ Target branch exists."
+          else
+            echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
+            exit 1
+          fi
 
-      - name: Cherry-pick commit
+      - name: Fetch all branches
+        run: git fetch --all
+
+      - name: Checkout target branch
+        run: |
+          git checkout ${{ steps.resolved-target.outputs.branch }}
+          git pull origin ${{ steps.resolved-target.outputs.branch }}
+
+      - name: Cherry-pick commit to target branch
         id: cherry-pick
         run: |
-          COMMIT=${{ steps.commit-hash.outputs.hash }}
+          COMMIT="${{ steps.input-vars.outputs.commit_hash }}"
 
-          # Detect number of parents
-          PARENT_COUNT=$(git rev-list --parents -n 1 $COMMIT | wc -w)
-          # Explanation:
-          # 2 words = normal commit (sha parent)
-          # 3 words = merge commit (sha parent1 parent2)
-
-          if [ "$PARENT_COUNT" -gt 2 ]; then
+          # MERGE COMMIT DETECTION
+          # Merge commits have multiple parents and require special handling
+          # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
+          # - ^2 notation: refers to the second parent of a commit
+          # - If second parent exists: it's a merge commit, use -m 1 flag
+          # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
+          # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
+          if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
             echo "Merge commit detected → using -m 1"
             PICK_CMD="git cherry-pick -m 1 $COMMIT"
           else
@@ -64,13 +183,22 @@ jobs:
           fi
 
           echo "Running: $PICK_CMD"
+          # EXECUTE CHERRY-PICK
+          # Capture success/failure status for later steps (push, comment, etc.)
           if $PICK_CMD; then
+            # Cherry-pick succeeded - set output for downstream steps
             echo "status=success" >> $GITHUB_OUTPUT
             echo "Cherry-pick successful"
           else
+            # Cherry-pick failed - could be conflicts or other git errors
             echo "status=failed" >> $GITHUB_OUTPUT
             echo "Cherry-pick failed, checking for conflicts..."
 
+            # CONFLICT DETECTION AND CLEANUP
+            # - git status --porcelain: machine-readable git status
+            # - ^UU: "unmerged, both modified" status code indicates merge conflict
+            # - Abort cherry-pick to leave repo in clean state for manual intervention
+            # - Without abort: repo stays in conflicted state, blocking other operations
             if git status --porcelain | grep -q "^UU"; then
               echo "Conflicts detected → aborting cherry-pick"
               git cherry-pick --abort
@@ -79,37 +207,89 @@ jobs:
             exit 1
           fi
 
-      - name: Push to UAT branch
+      - name: Push to target branch
         if: steps.cherry-pick.outputs.status == 'success'
         run: |
-          git push origin uat
+          git push origin ${{ steps.resolved-target.outputs.branch }}
 
-      - name: Create comment on PR
-        if: always()
+      - name: Find associated PR for commit
+        # Only run for manual triggers
+        # Auto triggers already have PR number from event context
+        # Manual triggers need to search for the PR that contains the commit
+        # This enables commenting on the original PR even when manually cherry-picking
+        if: steps.input-vars.outputs.trigger_type == 'manual'
+        id: find-pr
         uses: actions/github-script@v7
         with:
           script: |
-            const { owner, repo, number } = context.issue;
-            const commitHash = '${{ steps.commit-hash.outputs.hash }}';
-            const status = '${{ steps.cherry-pick.outputs.status }}';
+            const commit = "${{ steps.input-vars.outputs.commit_hash }}";
+            const { owner, repo } = context.repo;
+
+            // Query GitHub API for PRs associated with the commit
+            // Returns array of PRs where this commit appears
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner,
+              repo,
+              commit_sha: commit
+            });
+
+            // Take first PR if found, otherwise empty string
+            // Empty string is easier to check in subsequent conditionals than undefined/null
+            core.setOutput("pr_number", prs.data[0]?.number ?? "");
+
+      - name: Comment on PR
+        # Comment on PR if we have a PR number
+        # Conditions breakdown:
+        # 1. always(): Run this step regardless of previous step failures
+        #    - Ensures we comment on PR even if cherry-pick failed (to notify of failure)
+        #    - Without this, step would be skipped if cherry-pick step failed
+        # 2. pr_number != '': Check if we have a PR to comment on
+        #    - Auto trigger: pr_number from event context (always present)
+        #    - Manual trigger: pr_number from find-pr step (may be empty if no PR found)
+        #    - Only comment if PR exists (prevents API errors from missing PR number)
+        if: |
+          always() &&
+          (steps.input-vars.outputs.pr_number != '' || steps.find-pr.outputs.pr_number != '')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // Use PR number from either auto trigger or manual search
+            // || operator: uses first truthy value (auto PR number takes precedence)
+            const prNumber = ${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }};
+            const targetBranch = "${{ steps.resolved-target.outputs.branch }}";
+            const commitHash = "${{ steps.input-vars.outputs.commit_hash }}";
+            const status = "${{ steps.cherry-pick.outputs.status }}";
+            const triggerType = "${{ steps.input-vars.outputs.trigger_type }}";
 
             let comment = '';
-            if (status === 'success') {
-              comment = `✅ **Cherry-pick Successful**\n\nCommit \`${commitHash}\` has been cherry-picked to the \`uat\` branch.`;
+            // Prefix indicates how workflow was triggered (helps users understand context)
+            const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
+
+            // Build success or failure message based on cherry-pick status
+            if (status === "success") {
+              comment = `✅ ${prefix}\n\nCommit \`${commitHash}\` has been cherry-picked to the \`${targetBranch}\` branch.`;
             } else {
-              comment = `❌ **Cherry-pick Failed**\n\nFailed to cherry-pick commit \`${commitHash}\` to the \`uat\` branch. Manual intervention may be required.`;
+              comment = `❌ ${prefix}\n\nFailed to cherry-pick commit \`${commitHash}\` to the \`${targetBranch}\` branch. Manual intervention may be required.`;
             }
 
+            // Post comment to PR (Issues API is used for PR comments)
             await github.rest.issues.createComment({
               owner,
               repo,
-              issue_number: number,
+              issue_number: prNumber,
               body: comment
             });
+
+      - name: No associated PR found
+        if: |
+          steps.input-vars.outputs.trigger_type == 'manual' &&
+          steps.find-pr.outputs.pr_number == ''
+        run: echo "ℹ️ No associated PR found for commit ${{ steps.input-vars.outputs.commit_hash }}."
 
       - name: Handle cherry-pick failure
         if: steps.cherry-pick.outputs.status == 'failed'
         run: |
-          echo "Cherry-pick failed for commit ${{ steps.commit-hash.outputs.hash }}"
+          echo "Cherry-pick failed for commit ${{ steps.input-vars.outputs.commit_hash }}"
           echo "Manual cherry-pick may be required"
           exit 1
