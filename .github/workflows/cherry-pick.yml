@@ -41,11 +41,10 @@ permissions:
   pull-requests: write
 
 # Dynamic run name that adapts based on how the workflow was triggered:
-# - Auto trigger (PR merge): "Cherry-pick {merge_commit_sha} to uat"
-# - Manual trigger with predefined branch: "Cherry-pick {commit_hash} to {uat|live}"
-# - Manual trigger with custom branch: "Cherry-pick {commit_hash} to {custom_branch_name}"
-run-name: ${{ github.event_name == 'pull_request' && format('Cherry-pick {0} to uat', github.event.pull_request.merge_commit_sha) || format('Cherry-pick {0} to {1}', github.event.inputs.commit_hash, github.event.inputs.target_branch == 'custom' && github.event.inputs.custom_target_branch || github.event.inputs.target_branch) }}
-
+# - Auto trigger (PR merge): "Cherry-pick {merge_commit_sha} from {base_branch} to uat"
+# - Manual trigger with predefined branch: "Cherry-pick {commit_hash} from {ref_name} to {uat|live}"
+# - Manual trigger with custom branch: "Cherry-pick {commit_hash} from {ref_name} to {custom_branch_name}"
+run-name: ${{ github.event_name == 'pull_request' && format('Cherry-pick {0} from {1} to uat', github.event.pull_request.merge_commit_sha, github.event.pull_request.base.ref) || format('Cherry-pick {0} from {1} to {2}', github.event.inputs.commit_hash, github.ref_name, github.event.inputs.target_branch == 'custom' && github.event.inputs.custom_target_branch || github.event.inputs.target_branch) }}
 jobs:
   cherry-pick:
     if: |
