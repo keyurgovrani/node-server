@@ -252,8 +252,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-          persist-credentials: false
 
       - name: Configure Git
         run: |
@@ -278,12 +276,14 @@ jobs:
           # - git ls-remote: queries remote repository for branch refs
           # - grep -q: silently checks if branch name appears in output
           # - Early exit prevents confusing error messages from git checkout/cherry-pick
-          if git ls-remote --heads origin ${{ steps.resolved-target.outputs.branch }} \
+          if git ls-remote --heads \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} \
+            ${{ steps.resolved-target.outputs.branch }} \
             | grep -q "${{ steps.resolved-target.outputs.branch }}"; then
-            echo "✅ Target branch exists."
+              echo "✅ Target branch exists."
           else
-            echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
-            exit 1
+              echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
+              exit 1
           fi
 
       - name: Fetch all branches
