@@ -204,22 +204,22 @@ jobs:
       - name: Print final sanitized inputs
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📋 Final Cherry-pick Configuration"
+          echo "Final Cherry-pick Configuration"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "🔧 Trigger Type:      ${{ steps.input-vars.outputs.trigger_type }}"
-          echo "📍 Source Branch:     ${{ steps.input-vars.outputs.source_branch }}"
-          echo "🎯 Target Branch:     ${{ steps.input-vars.outputs.target_branch }}${{ steps.input-vars.outputs.target_branch == 'custom' && format(' → {0}', steps.input-vars.outputs.custom_target_branch) || '' }}"
+          echo "Trigger Type:      ${{ steps.input-vars.outputs.trigger_type }}"
+          echo "Source Branch:     ${{ steps.input-vars.outputs.source_branch }}"
+          echo "Target Branch:     ${{ steps.input-vars.outputs.target_branch }}${{ steps.input-vars.outputs.target_branch == 'custom' && format(' → {0}', steps.input-vars.outputs.custom_target_branch) || '' }}"
           echo ""
-          echo "📦 Commit Hash:       ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
+          echo "Commit Hash:       ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
           
           if [[ -n "${{ steps.input-vars.outputs.pr_number }}" ]]; then
             echo "🔗 PR Number:         #${{ steps.input-vars.outputs.pr_number }}"
           fi
           
           if [[ -n "${{ steps.resolve-commit.outputs.pr_title }}" ]]; then
-            echo "📝 PR Title:          ${{ steps.resolve-commit.outputs.pr_title }}"
-            echo "🪵 PR Base Branch:    ${{ steps.resolve-commit.outputs.base_branch }}"
+            echo "PR Title:          ${{ steps.resolve-commit.outputs.pr_title }}"
+            echo "PR Base Branch:    ${{ steps.resolve-commit.outputs.base_branch }}"
           fi
           
           echo ""
