@@ -214,7 +214,7 @@ jobs:
           echo "Commit Hash:       ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
           
           if [[ -n "${{ steps.input-vars.outputs.pr_number }}" ]]; then
-            echo "🔗 PR Number:         #${{ steps.input-vars.outputs.pr_number }}"
+            echo "PR Number:         #${{ steps.input-vars.outputs.pr_number }}"
           fi
           
           if [[ -n "${{ steps.resolve-commit.outputs.pr_title }}" ]]; then
@@ -252,6 +252,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.PAT }}
 
       - name: Configure Git
         run: |
@@ -276,14 +278,12 @@ jobs:
           # - git ls-remote: queries remote repository for branch refs
           # - grep -q: silently checks if branch name appears in output
           # - Early exit prevents confusing error messages from git checkout/cherry-pick
-          if git ls-remote --heads \
-            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} \
-            ${{ steps.resolved-target.outputs.branch }} \
+          if git ls-remote --heads origin ${{ steps.resolved-target.outputs.branch }} \
             | grep -q "${{ steps.resolved-target.outputs.branch }}"; then
-              echo "✅ Target branch exists."
+            echo "✅ Target branch exists."
           else
-              echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
-              exit 1
+            echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
+            exit 1
           fi
 
       - name: Fetch all branches
@@ -344,7 +344,7 @@ jobs:
       - name: Push to target branch
         if: steps.cherry-pick.outputs.status == 'success'
         run: |
-          git push origin ${{ steps.resolved-target.outputs.branch }}
+          git push https://x-access-token:${{ secrets.PAT }}@github.com/${{ github.repository }}.git ${{ steps.resolved-target.outputs.branch }}
 
       - name: Find associated PR for commit
         # Only run for manual triggers when commit was provided directly (not from PR input)
