@@ -271,6 +271,12 @@ jobs:
             git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
           fi
 
+      - name: Configure Git Remote with PAT
+        run: |
+          # Configure git remote to use PAT for authentication
+          # This is necessary because persist-credentials: false disables automatic auth
+          git remote set-url origin https://x-access-token:${{ secrets.PAT }}@github.com/${{ github.repository }}.git
+
       - name: Validate target branch exists
         run: |
           # Verify the target branch exists on remote before attempting cherry-pick
@@ -344,7 +350,7 @@ jobs:
       - name: Push to target branch
         if: steps.cherry-pick.outputs.status == 'success'
         run: |
-          git push https://x-access-token:${{ secrets.PAT }}@github.com/${{ github.repository }}.git ${{ steps.resolved-target.outputs.branch }}
+          git push origin ${{ steps.resolved-target.outputs.branch }}
 
       - name: Find associated PR for commit
         # Only run for manual triggers when commit was provided directly (not from PR input)
