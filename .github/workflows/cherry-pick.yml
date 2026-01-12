@@ -517,13 +517,13 @@ jobs:
             // Prefix indicates how workflow was triggered (helps users understand context)
             const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
             // Add merge type info for debugging
-            const mergeInfo = mergeType ? `\n*Merge type: ${mergeType}${mergeType === 'Rebase and Merge' ? ` (${commitCount} commits)` : ''}*` : '';
+            const mergeInfo = mergeType ? `\nMerge type: ${mergeType}${mergeType === 'Rebase and Merge' ? ` (${commitCount} commits)` : ''}` : '';
             
             // Determine failure reason and build appropriate message
             if (cherryPickStatus === "success") {
               const commitInfo = mergeType === 'Rebase and Merge' 
                 ? `${commitCount} commits from PR #${prNumber} have been` 
-                : `commit \`${commitHash}\` has been`;
+                : `Commit \`${commitHash}\` has been`;
               comment = `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${mergeInfo}`;
             } else {
               comment = `❌ ${prefix}\n\n**Merge conflicts detected** while cherry-picking to the \`${targetBranch}\` branch.\n\nManual intervention required to resolve conflicts.${mergeInfo}`;
