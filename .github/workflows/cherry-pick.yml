@@ -516,6 +516,8 @@ jobs:
             let comment = '';
             // Prefix indicates how workflow was triggered (helps users understand context)
             const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
+            // Add merge type info for debugging
+            const mergeInfo = mergeType ? `\n*Merge type: ${mergeType}${mergeType === 'rebase-merge' ? ` (${commitCount} commits)` : ''}*` : '';
             
             // Determine failure reason and build appropriate message
             if (cherryPickStatus === "success") {
