@@ -46,15 +46,15 @@ permissions:
   pull-requests: write
 
 # Dynamic run name that adapts based on how the workflow was triggered:
-# - Auto trigger (PR merge): "Cherry-pick #{pr_number} from {base_branch} to uat"
+# - Auto trigger (PR merge): "Cherry-pick {merge_commit_sha} from {base_branch} to uat"
 # - Manual trigger with commit: "Cherry-pick {commit_hash} from {ref_name} to {target}"
-# - Manual trigger with PR: "Cherry-pick PR {pr_number} from {ref_name} to {target}"
+# - Manual trigger with PR: "Cherry-pick PR from {ref_name} to {target}"
 run-name: >-
   ${{
     github.event_name == 'pull_request'
       && format(
-          'Cherry-pick #{0} from {1} to uat',
-          github.event.pull_request.number,
+          'Cherry-pick {0} from {1} to uat',
+          github.event.pull_request.merge_commit_sha,
           github.event.pull_request.base.ref
         )
       || (
@@ -105,7 +105,7 @@ jobs:
             TRIGGER_TYPE="auto"
           else
             # MANUAL TRIGGER PATH: workflow_dispatch with user-provided inputs
-            # - COMMIT_HASH: user-provided commit SHA to cherry-pick
+            # - COMMIT_HASH: user-provided commit SHA to cherry-pick (prioritized if both provided)
             # - PR_NUMBER: extracted from user input (supports multiple formats):
             #   * Plain number: "14642" → extracts "14642"
             #   * Full URL: "https://github.com/unify-apps/www/pull/14642" → extracts "14642"
@@ -293,6 +293,58 @@ jobs:
           git checkout ${{ steps.resolved-target.outputs.branch }}
           git pull origin ${{ steps.resolved-target.outputs.branch }}
 
+      - name: Cherry-pick commit to target branch
+        id: cherry-pick
+        run: |
+          # Use resolved commit hash from PR if available, otherwise use direct input
+          # Priority: final-commit (from PR) > input-vars (direct commit hash)
+          COMMIT="${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
+
+          # MERGE COMMIT DETECTION
+          # Merge commits have multiple parents and require special handling
+          # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
+          # - ^2 notation: refers to the second parent of a commit
+          # - If second parent exists: it's a merge commit, use -m 1 flag
+          # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
+          # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
+          if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
+            echo "Merge commit detected → using -m 1"
+            PICK_CMD="git cherry-pick -m 1 $COMMIT"
+          else
+            echo "Normal commit detected → standard cherry-pick"
+            PICK_CMD="git cherry-pick $COMMIT"
+          fi
+
+          echo "Running: $PICK_CMD"
+          # EXECUTE CHERRY-PICK
+          # Capture success/failure status for later steps (push, comment, etc.)
+          if $PICK_CMD; then
+            # Cherry-pick succeeded - set output for downstream steps
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Cherry-pick successful"
+          else
+            # Cherry-pick failed - could be conflicts or other git errors
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "Cherry-pick failed, checking for conflicts..."
+
+            # CONFLICT DETECTION AND CLEANUP
+            # - git status --porcelain: machine-readable git status
+            # - ^UU: "unmerged, both modified" status code indicates merge conflict
+            # - Abort cherry-pick to leave repo in clean state for manual intervention
+            # - Without abort: repo stays in conflicted state, blocking other operations
+            if git status --porcelain | grep -q "^UU"; then
+              echo "Conflicts detected → aborting cherry-pick"
+              git cherry-pick --abort
+            fi
+
+            exit 1
+          fi
+
+      - name: Push to target branch
+        if: steps.cherry-pick.outputs.status == 'success'
+        run: |
+          git push origin ${{ steps.resolved-target.outputs.branch }}
+
       - name: Find associated PR for commit
         # Only run for manual triggers when commit was provided directly (not from PR input)
         # Auto triggers already have PR number from event context
@@ -321,168 +373,6 @@ jobs:
             // Empty string is easier to check in subsequent conditionals than undefined/null
             core.setOutput("pr_number", prs.data[0]?.number ?? "");
 
-      - name: Detect merge type and get commits to cherry-pick
-        id: detect-merge
-        run: |
-          # Use resolved commit hash from PR if available, otherwise use direct input
-          # Priority: final-commit (from PR) > input-vars (direct commit hash)
-          COMMIT="${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
-          PR_NUMBER="${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}"
-          
-          # Get commit message to detect merge type
-          COMMIT_MSG=$(git log --format=%B -n 1 "$COMMIT")
-          echo "Commit message: $COMMIT_MSG"
-          
-          # MERGE TYPE DETECTION:
-          # - Squash and Merge: commit message contains (#PR_NUMBER)
-          # - Rebase and Merge: commit message does not contain (#PR_NUMBER)
-          # - Merge Commit: has multiple parents (detected by git rev-parse)
-          
-          # MERGE COMMIT DETECTION
-          # Merge commits have multiple parents and require special handling
-          # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
-          # - ^2 notation: refers to the second parent of a commit
-          # - If second parent exists: it's a merge commit, use -m 1 flag
-          # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
-          # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
-          if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
-            echo "merge_type=merge-commit" >> $GITHUB_OUTPUT
-            echo "commits=$COMMIT" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Merge Commit (multiple parents)"
-          elif echo "$COMMIT_MSG" | grep -q "(#$PR_NUMBER)"; then
-            # Commit message contains (#PR_NUMBER) = squash merge
-            echo "merge_type=squash-merge" >> $GITHUB_OUTPUT
-            echo "commits=$COMMIT" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Squash and Merge (contains #$PR_NUMBER in message)"
-          else
-            # No (#PR_NUMBER) in message = rebase merge, need all PR commits
-            echo "merge_type=rebase-merge" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Rebase and Merge (no #$PR_NUMBER in message)"
-            
-            # For rebase merges, we need to get all commits from the PR
-            # These commits are now part of the base branch's history
-            echo "Fetching all commits from PR #$PR_NUMBER..."
-          fi
-
-      - name: Get all commits for rebase merge
-        if: steps.detect-merge.outputs.merge_type == 'rebase-merge'
-        id: get-rebase-commits
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prNumber = "${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}";
-            const { owner, repo } = context.repo;
-
-            try {
-              // Get all commits from the PR
-              const { data: commits } = await github.rest.pulls.listCommits({
-                owner,
-                repo,
-                pull_number: parseInt(prNumber),
-                per_page: 100
-              });
-
-              if (commits.length === 0) {
-                core.setFailed(`❌ No commits found in PR #${prNumber}`);
-                return;
-              }
-
-              // Extract commit SHAs in order (oldest to newest)
-              const commitShas = commits.map(c => c.sha);
-              const commitsStr = commitShas.join(' ');
-              
-              console.log(`✅ Found ${commits.length} commits in PR #${prNumber}`);
-              console.log(`Commits to cherry-pick: ${commitsStr}`);
-              
-              core.setOutput("commits", commitsStr);
-              core.setOutput("commit_count", commits.length);
-
-            } catch (error) {
-              core.setFailed(`❌ Failed to fetch commits for PR #${prNumber}: ${error.message}`);
-            }
-
-      - name: Cherry-pick commits to target branch
-        id: cherry-pick
-        run: |
-          # Get commits to cherry-pick based on merge type
-          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "rebase-merge" ]]; then
-            COMMITS="${{ steps.get-rebase-commits.outputs.commits }}"
-            COMMIT_COUNT="${{ steps.get-rebase-commits.outputs.commit_count }}"
-            echo "Cherry-picking $COMMIT_COUNT commits from rebased PR"
-          else
-            COMMITS="${{ steps.detect-merge.outputs.commits }}"
-            COMMIT_COUNT="1"
-            echo "Cherry-picking single commit"
-          fi
-          
-          echo "Merge Type: ${{ steps.detect-merge.outputs.merge_type }}"
-          echo "Commits: $COMMITS"
-          echo ""
-          
-          # Track if any cherry-pick fails
-          PICK_FAILED=false
-          
-          # Cherry-pick each commit in order
-          for COMMIT in $COMMITS; do
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Cherry-picking: $COMMIT"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            
-            # MERGE COMMIT DETECTION
-            # Merge commits have multiple parents and require special handling
-            # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
-            # - ^2 notation: refers to the second parent of a commit
-            # - If second parent exists: it's a merge commit, use -m 1 flag
-            # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
-            # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
-            # Check if it's a merge commit (has multiple parents)
-            if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
-              echo "Merge commit detected → using -m 1"
-              PICK_CMD="git cherry-pick -m 1 $COMMIT"
-            else
-              echo "Normal commit → standard cherry-pick"
-              PICK_CMD="git cherry-pick $COMMIT"
-            fi
-            
-            echo "Running: $PICK_CMD"
-            # EXECUTE CHERRY-PICK
-            # Capture success/failure status for later steps (push, comment, etc.)
-            if $PICK_CMD; then
-              echo "✅ Cherry-pick successful for $COMMIT"
-            else
-              echo "❌ Cherry-pick failed for $COMMIT"
-              PICK_FAILED=true
-              
-              # CONFLICT DETECTION AND CLEANUP
-              # - git status --porcelain: machine-readable git status
-              # - ^UU: "unmerged, both modified" status code indicates merge conflict
-              # - Abort cherry-pick to leave repo in clean state for manual intervention
-              # - Without abort: repo stays in conflicted state, blocking other operations
-              if git status --porcelain | grep -q "^UU"; then
-                echo "Conflicts detected → aborting cherry-pick"
-                git cherry-pick --abort
-              fi
-              
-              break
-            fi
-            echo ""
-          done
-          
-          if [[ "$PICK_FAILED" == "true" ]]; then
-            # Cherry-pick failed - could be conflicts or other git errors
-            echo "status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          else
-            # Cherry-pick succeeded - set output for downstream steps
-            echo "status=success" >> $GITHUB_OUTPUT
-            echo "✅ All commits cherry-picked successfully"
-          fi
-
-      - name: Push to target branch
-        if: steps.cherry-pick.outputs.status == 'success'
-        run: |
-          git push origin ${{ steps.resolved-target.outputs.branch }}
-
       - name: Comment on PR
         # Comment on PR if we have a PR number
         # Conditions breakdown:
@@ -508,23 +398,18 @@ jobs:
             const targetBranch = "${{ steps.resolved-target.outputs.branch }}";
             // Use resolved commit hash if available, otherwise use direct input
             const commitHash = "${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}";
-            const cherryPickStatus = "${{ steps.cherry-pick.outputs.status }}";
+            const status = "${{ steps.cherry-pick.outputs.status }}";
             const triggerType = "${{ steps.input-vars.outputs.trigger_type }}";
-            const mergeType = "${{ steps.detect-merge.outputs.merge_type }}";
-            const commitCount = "${{ steps.get-rebase-commits.outputs.commit_count || '1' }}";
 
             let comment = '';
             // Prefix indicates how workflow was triggered (helps users understand context)
             const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
-            
-            // Determine failure reason and build appropriate message
-            if (cherryPickStatus === "success") {
-              const commitInfo = mergeType === 'rebase-merge' 
-                ? `${commitCount} commits from PR #${prNumber}` 
-                : `commit \`${commitHash}\``;
-              comment = `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${mergeInfo}`;
+
+            // Build success or failure message based on cherry-pick status with reference workflow run
+            if (status === "success") {
+              comment = `✅ ${prefix}\n\nCommit \`${commitHash}\` has been cherry-picked to the \`${targetBranch}\` branch.`;
             } else {
-              comment = `❌ ${prefix}\n\n**Merge conflicts detected** while cherry-picking to the \`${targetBranch}\` branch.\n\nManual intervention required to resolve conflicts.${mergeInfo}`;
+              comment = `❌ ${prefix}\n\nFailed to cherry-pick commit \`${commitHash}\` to the \`${targetBranch}\` branch. Manual intervention may be required.`;
             }
 
             comment += `\n\n[View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
@@ -547,7 +432,6 @@ jobs:
       - name: Handle cherry-pick failure
         if: steps.cherry-pick.outputs.status == 'failed'
         run: |
-          echo "Cherry-pick failed"
+          echo "Cherry-pick failed for commit ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
           echo "Manual cherry-pick may be required"
           exit 1
-          
