@@ -346,17 +346,17 @@ jobs:
           # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
           # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
           if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
-            echo "merge_type=merge-commit" >> $GITHUB_OUTPUT
+            echo "merge_type=Merge Commit" >> $GITHUB_OUTPUT
             echo "commits=$COMMIT" >> $GITHUB_OUTPUT
             echo "✅ Detected: Merge Commit (multiple parents)"
           elif echo "$COMMIT_MSG" | grep -q "(#$PR_NUMBER)"; then
             # Commit message contains (#PR_NUMBER) = squash merge
-            echo "merge_type=squash-merge" >> $GITHUB_OUTPUT
+            echo "merge_type=Squash and Merge" >> $GITHUB_OUTPUT
             echo "commits=$COMMIT" >> $GITHUB_OUTPUT
             echo "✅ Detected: Squash and Merge (contains #$PR_NUMBER in message)"
           else
             # No (#PR_NUMBER) in message = rebase merge, need all PR commits
-            echo "merge_type=rebase-merge" >> $GITHUB_OUTPUT
+            echo "merge_type=Rebase and Merge" >> $GITHUB_OUTPUT
             echo "✅ Detected: Rebase and Merge (no #$PR_NUMBER in message)"
             
             # For rebase merges, we need to get all commits from the PR
@@ -405,7 +405,7 @@ jobs:
         id: cherry-pick
         run: |
           # Get commits to cherry-pick based on merge type
-          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "rebase-merge" ]]; then
+          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "Rebase and Merge" ]]; then
             COMMITS="${{ steps.get-rebase-commits.outputs.commits }}"
             COMMIT_COUNT="${{ steps.get-rebase-commits.outputs.commit_count }}"
             echo "Cherry-picking $COMMIT_COUNT commits from rebased PR"
@@ -517,13 +517,13 @@ jobs:
             // Prefix indicates how workflow was triggered (helps users understand context)
             const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
             // Add merge type info for debugging
-            const mergeInfo = mergeType ? `\n*Merge type: ${mergeType}${mergeType === 'rebase-merge' ? ` (${commitCount} commits)` : ''}*` : '';
+            const mergeInfo = mergeType ? `\n*Merge type: ${mergeType}${mergeType === 'Rebase and Merge' ? ` (${commitCount} commits)` : ''}*` : '';
             
             // Determine failure reason and build appropriate message
             if (cherryPickStatus === "success") {
-              const commitInfo = mergeType === 'rebase-merge' 
-                ? `${commitCount} commits from PR #${prNumber}` 
-                : `commit \`${commitHash}\``;
+              const commitInfo = mergeType === 'Rebase and Merge' 
+                ? `${commitCount} commits from PR #${prNumber} have been` 
+                : `commit \`${commitHash}\` has been`;
               comment = `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${mergeInfo}`;
             } else {
               comment = `❌ ${prefix}\n\n**Merge conflicts detected** while cherry-picking to the \`${targetBranch}\` branch.\n\nManual intervention required to resolve conflicts.${mergeInfo}`;
