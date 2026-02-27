@@ -27,6 +27,6 @@ app.post("/api/data", (req, res) => {
 // Start server
 app.listen(PORT, () => {
 	console.log("Environment:", process.env.NODE_ENV);
-	console.log("Port:", PORT);
+	console.log("Print Port:", PORT);
 	console.log(`Server is running on http://localhost:${PORT}`);
 });
