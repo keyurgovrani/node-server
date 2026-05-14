@@ -33,15 +33,11 @@ on:
     branches:
       - main
 
-concurrency:
-  # Concurrency group ensures only one cherry-pick operation runs at a time per PR or workflow run
-  # - For auto-triggered PRs: uses PR number to prevent concurrent cherry-picks of the same PR
-  # - For manual triggers: uses unique run_id since there's no PR number
-  # - cancel-in-progress: false ensures in-flight cherry-picks complete rather than being cancelled
-  group: cherry-pick-pr-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: false
+# Native GitHub Actions concurrency is intentionally not used here.
+# This workflow uses an explicit queue action later in the job, keyed by the resolved target branch.
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -136,7 +132,7 @@ jobs:
           steps.input-vars.outputs.commit_hash == '' &&
           steps.input-vars.outputs.pr_number != ''
         id: resolve-commit
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const prNumber = "${{ steps.input-vars.outputs.pr_number }}";
@@ -249,7 +245,7 @@ jobs:
           echo "Target branch (cherry-pick destination): $(cat $GITHUB_OUTPUT | grep branch= | cut -d= -f2)"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT }}
@@ -285,6 +281,22 @@ jobs:
             exit 1
           fi
 
+      - name: Wait for target branch queue
+        # Pinned to v3.2.3 by SHA. v3.2.4 (released 2026-05-04) added an unbounded
+        # multi-status, multi-workflow paginated discovery pass that exhausts the
+        # 5000 req/hr GitHub API rate limit and silently stalls for ~10-12 minutes
+        # before giving up. See https://github.com/softprops/turnstyle/pull/142.
+        uses: softprops/turnstyle@e565d2d86403c5d23533937e95980570545e5586 # v3.2.3
+        with:
+          # turnstyle creates a durable in-workflow wait instead of GitHub's lossy single-pending concurrency slot.
+          # Queue by destination branch so unrelated target branches can still process in parallel.
+          # queue-name must be a substring of the workflow's run-name (display_title) because
+          # turnstyle matches via `display_title.includes(queueName)`.
+          queue-name: to ${{ steps.resolved-target.outputs.branch }}
+          same-branch-only: false
+          abort-after-seconds: 600
+          poll-interval-seconds: 60
+
       - name: Fetch all branches
         run: git fetch --all
 
@@ -303,7 +315,7 @@ jobs:
           steps.input-vars.outputs.trigger_type == 'manual' &&
           steps.input-vars.outputs.pr_number == ''
         id: find-pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const commit = "${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}";
@@ -365,41 +377,25 @@ jobs:
           fi
 
       - name: Get all commits for rebase merge
-        if: steps.detect-merge.outputs.merge_type == 'rebase-merge'
+        if: steps.detect-merge.outputs.merge_type == 'Rebase and Merge'
         id: get-rebase-commits
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prNumber = "${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}";
-            const { owner, repo } = context.repo;
-
-            try {
-              // Get all commits from the PR
-              const { data: commits } = await github.rest.pulls.listCommits({
-                owner,
-                repo,
-                pull_number: parseInt(prNumber),
-                per_page: 100
-              });
-
-              if (commits.length === 0) {
-                core.setFailed(`❌ No commits found in PR #${prNumber}`);
-                return;
-              }
-
-              // Extract commit SHAs in order (oldest to newest)
-              const commitShas = commits.map(c => c.sha);
-              const commitsStr = commitShas.join(' ');
-              
-              console.log(`✅ Found ${commits.length} commits in PR #${prNumber}`);
-              console.log(`Commits to cherry-pick: ${commitsStr}`);
-              
-              core.setOutput("commits", commitsStr);
-              core.setOutput("commit_count", commits.length);
-
-            } catch (error) {
-              core.setFailed(`❌ Failed to fetch commits for PR #${prNumber}: ${error.message}`);
-            }
+        env:
+          MERGE_SHA: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
+          PR_NUMBER: ${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          # Rebase rewrites every commit SHA (new parent → new SHA), so
+          # listCommits(PR) would return PRE-rebase SHAs that don't exist
+          # on main. Instead: ask API only for the commit count N, then
+          # walk first-parent back N steps from merge_commit_sha on main
+          # to enumerate the actual rebased commits. Tip is guaranteed to
+          # be merge_commit_sha; range is guaranteed linear post-rebase.
+          N=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits')
+          COMMITS=$(git log --reverse --first-parent --format=%H -n "$N" "$MERGE_SHA" | tr '\n' ' ' | xargs)
+          echo "✅ Resolved $N rebased commits (tip: $MERGE_SHA)"
+          echo "Commits to cherry-pick: $COMMITS"
+          echo "commits=$COMMITS" >> $GITHUB_OUTPUT
+          echo "commit_count=$N" >> $GITHUB_OUTPUT
 
       - name: Cherry-pick commits to target branch
         id: cherry-pick
@@ -496,7 +492,7 @@ jobs:
         if: |
           always() &&
           (steps.input-vars.outputs.pr_number != '' || steps.find-pr.outputs.pr_number != '')
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const { owner, repo } = context.repo;
