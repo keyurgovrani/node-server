@@ -97,6 +97,7 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG reset from $SOURCE" \
             --notes "Reset of \`$TARGET\` from \`$SOURCE\` on $DATE_TAG. Pre-reset backup: \`$BACKUP\`." \
+            --generate-notes \
             "${PRE[@]}"
 
           # 3. reset target := source
