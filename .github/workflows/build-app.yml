@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       env:
-        description: 'Target environment (uat | prod)'
+        description: 'Target environment'
         required: true
-        type: string
+        type: choice
+        default: uat
+        options: [qa, uat, prod]
 
 jobs:
   build:
