@@ -1,0 +1,149 @@
+name: Reset Release Branch
+run-name: Reset ${{ inputs.target }} ← ${{ inputs.target == 'uat' && 'main' || 'uat' }}${{ inputs.trigger_build && ' and Build Apps' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Branch to reset (uat ← main, live ← uat)'
+        required: true
+        type: choice
+        options: [uat, live]
+      trigger_build:
+        description: 'Trigger Build Apps after reset (uat→env=uat, live→env=prod)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: reset-${{ github.event.inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate dispatch ref == target in {uat,live}
+        run: |
+          set -euo pipefail
+          REF="${{ github.ref_name }}"
+          TARGET="${{ inputs.target }}"
+          if [[ "$REF" != "uat" && "$REF" != "live" ]]; then
+            echo "::error::Dispatch from the uat or live branch (got '$REF')"
+            exit 1
+          fi
+          if [[ "$REF" != "$TARGET" ]]; then
+            echo "::error::target=$TARGET but dispatched from $REF; dispatch the $TARGET reset from the $TARGET branch"
+            exit 1
+          fi
+          echo "Guard passed: resetting '$TARGET' (dispatched from '$REF')"
+
+  reset:
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target == 'uat' && 'reset-uat' || 'reset-live' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Set up Git config
+        run: |
+          set -euo pipefail
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Backup, tag, release, reset
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.target }}"
+          if [[ "$TARGET" == "uat" ]]; then
+            SOURCE="main"
+            PRE=(--prerelease)
+          else
+            SOURCE="uat"
+            PRE=()
+          fi
+
+          DATE_TAG="$(date '+%d.%m.%y')"
+          DATE_BAK="$(date '+%d-%b-%y' | tr '[:upper:]' '[:lower:]')"
+
+          git fetch --prune --force origin "+refs/heads/${SOURCE}:refs/remotes/origin/${SOURCE}" "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}" "+refs/tags/*:refs/tags/*"
+
+          # 1. backup branch of the CURRENT (pre-reset) target; never overwrite
+          BACKUP="${TARGET}-backup-${DATE_BAK}"
+          n=0
+          while git ls-remote --heads --exit-code origin "$BACKUP" >/dev/null 2>&1; do
+            n=$((n + 1))
+            BACKUP="${TARGET}-backup-${DATE_BAK}-${n}"
+          done
+          git push origin "refs/remotes/origin/${TARGET}:refs/heads/${BACKUP}"
+
+          # 2. tag + GitHub release of the CURRENT (pre-reset) target; collision -> .NN
+          TAG="${TARGET}-${DATE_TAG}"
+          if git ls-remote --tags --exit-code origin "$TAG" >/dev/null 2>&1; then
+            n=1
+            while git ls-remote --tags --exit-code origin "${TAG}.$(printf '%02d' "$n")" >/dev/null 2>&1; do
+              n=$((n + 1))
+            done
+            TAG="${TAG}.$(printf '%02d' "$n")"
+          fi
+          git tag "$TAG" "refs/remotes/origin/${TARGET}"
+          git push origin "refs/tags/${TAG}"
+          gh release create "$TAG" \
+            --title "$TAG reset from $SOURCE" \
+            --notes "Reset of \`$TARGET\` from \`$SOURCE\` on $DATE_TAG. Pre-reset backup: \`$BACKUP\`." \
+            "${PRE[@]}"
+
+          # 3. reset target := source
+          git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
+
+          {
+            echo "### Reset $TARGET ← $SOURCE"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Backup | \`$BACKUP\` |"
+            echo "| Tag/Release | \`$TAG\` |"
+            echo "| Release | $(gh release view "$TAG" --json url -q .url || echo n/a) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trigger Build Apps
+        if: ${{ inputs.trigger_build }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.target }}"
+          if [[ "$TARGET" == "uat" ]]; then
+            BUILD_ENV="uat"
+          else
+            BUILD_ENV="prod"
+          fi
+
+          BEFORE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          gh workflow run build-app.yml --repo keyurgovrani/node-server --ref "$TARGET" -f env="$BUILD_ENV"
+
+          # workflow_dispatch returns 204 with no run id; poll for the build-app
+          # run on this branch created after BEFORE and surface its URL
+          RUN_URL=""
+          for _attempt in $(seq 1 12); do
+            sleep 5
+            RUN_URL="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
+              --branch "$TARGET" --event workflow_dispatch --limit 10 \
+              --json url,createdAt \
+              --jq "[.[] | select(.createdAt > \"$BEFORE\")] | sort_by(.createdAt) | last | .url // empty")" || true
+            if [[ -n "$RUN_URL" ]]; then
+              break
+            fi
+          done
+
+          if [[ -n "$RUN_URL" ]]; then
+            echo "Triggered Build Apps on \`$TARGET\` (env=$BUILD_ENV): $RUN_URL" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Triggered Build Apps on \`$TARGET\` (env=$BUILD_ENV) — run link unresolved; check Actions" >> "$GITHUB_STEP_SUMMARY"
+          fi

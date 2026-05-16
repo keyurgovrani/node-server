@@ -1,0 +1,21 @@
+name: Build Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target environment (uat | prod)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build placeholder
+        run: |
+          set -euo pipefail
+          echo "Dummy Build Apps run for node-server"
+          echo "env=${{ inputs.env }}"
+          echo "ref=${{ github.ref_name }}"
+          echo "Reset-release-branch e2e smoke target — no real build performed."
