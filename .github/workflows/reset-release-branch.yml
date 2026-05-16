@@ -5,12 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Branch to reset (uat ← main, live ← uat)'
+        description: 'Branch to reset (uat ← main or live ← uat)'
         required: true
         type: choice
         options: [uat, live]
       trigger_build:
-        description: 'Trigger Build Apps after reset (uat→env=uat, live→env=prod)'
+        description: 'Trigger Build Apps after reset'
         type: boolean
         default: true
 
@@ -104,12 +104,12 @@ jobs:
           git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
 
           {
-            echo "### Reset $TARGET ← $SOURCE"
+            echo "### Reset $TARGET ← $SOURCE ($DATE_TAG)"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Backup | \`$BACKUP\` |"
-            echo "| Tag/Release | \`$TAG\` |"
+            echo "| Backup branch | \`$BACKUP\` |"
+            echo "| Tag | \`$TAG\` |"
             echo "| Release | $(gh release view "$TAG" --json url -q .url || echo n/a) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -126,25 +126,33 @@ jobs:
             BUILD_ENV="prod"
           fi
 
-          BEFORE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          # Snapshot existing build-app run ids BEFORE dispatch. workflow_dispatch
+          # returns 204 with no run id and the Actions list API is eventually
+          # consistent, so a timestamp filter races (same-second runs were missed
+          # under the old `createdAt > BEFORE`). Diffing run-id sets is immune to
+          # clock skew; poll up to ~3 min for the new id to appear.
+          PRE_IDS="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
+            --branch "$TARGET" --event workflow_dispatch --limit 50 \
+            --json databaseId --jq '[.[].databaseId]')" || PRE_IDS='[]'
+          PRE_IDS="${PRE_IDS:-[]}"
+
           gh workflow run build-app.yml --repo keyurgovrani/node-server --ref "$TARGET" -f env="$BUILD_ENV"
 
-          # workflow_dispatch returns 204 with no run id; poll for the build-app
-          # run on this branch created after BEFORE and surface its URL
           RUN_URL=""
-          for _attempt in $(seq 1 12); do
+          for _attempt in $(seq 1 36); do
             sleep 5
             RUN_URL="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
-              --branch "$TARGET" --event workflow_dispatch --limit 10 \
-              --json url,createdAt \
-              --jq "[.[] | select(.createdAt > \"$BEFORE\")] | sort_by(.createdAt) | last | .url // empty")" || true
+              --branch "$TARGET" --event workflow_dispatch --limit 50 \
+              --json databaseId,url \
+              | jq -r --argjson pre "$PRE_IDS" \
+                  '[.[] | select(.databaseId as $id | ($pre | index($id) | not))] | sort_by(.databaseId) | last | .url // empty')" || true
             if [[ -n "$RUN_URL" ]]; then
               break
             fi
           done
 
           if [[ -n "$RUN_URL" ]]; then
-            echo "Triggered Build Apps on \`$TARGET\` (env=$BUILD_ENV): $RUN_URL" >> "$GITHUB_STEP_SUMMARY"
+            echo "Triggered Build Apps on \`$TARGET\`: $RUN_URL" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Triggered Build Apps on \`$TARGET\` (env=$BUILD_ENV) — run link unresolved; check Actions" >> "$GITHUB_STEP_SUMMARY"
+            echo "Triggered Build Apps on \`$TARGET\` — run link unresolved; check Actions" >> "$GITHUB_STEP_SUMMARY"
           fi
