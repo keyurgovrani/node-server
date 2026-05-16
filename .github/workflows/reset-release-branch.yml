@@ -70,16 +70,17 @@ jobs:
           fi
 
           DATE_TAG="$(date '+%d.%m.%y')"
-          DATE_BAK="$(date '+%d-%b-%y' | tr '[:upper:]' '[:lower:]')"
+          DATE_BACKUP_BRANCH="$(date '+%d-%b-%y' | tr '[:upper:]' '[:lower:]')"
 
           git fetch --prune --force origin "+refs/heads/${SOURCE}:refs/remotes/origin/${SOURCE}" "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}" "+refs/tags/*:refs/tags/*"
 
-          # 1. backup branch of the CURRENT (pre-reset) target; never overwrite
-          BACKUP="${TARGET}-backup-${DATE_BAK}"
+          # 1. backup the pre-reset target; -N suffix until unused (concurrency
+          #    group serializes same-target runs, so this push needs no --force)
+          BACKUP="${TARGET}-backup-${DATE_BACKUP_BRANCH}"
           n=0
           while git ls-remote --heads --exit-code origin "$BACKUP" >/dev/null 2>&1; do
             n=$((n + 1))
-            BACKUP="${TARGET}-backup-${DATE_BAK}-${n}"
+            BACKUP="${TARGET}-backup-${DATE_BACKUP_BRANCH}-${n}"
           done
           git push origin "refs/remotes/origin/${TARGET}:refs/heads/${BACKUP}"
 
@@ -127,12 +128,9 @@ jobs:
           fi
 
           # Snapshot existing build-app run ids BEFORE dispatch. workflow_dispatch
-          # returns 204 with no run id and the Actions list API is eventually
-          # consistent, so a timestamp filter races (same-second runs were missed
-          # under the old `createdAt > BEFORE`). Diffing run-id sets is immune to
-          # clock skew; poll up to ~3 min for the new id to appear.
+          # returns 204 with no run id. poll up to ~3 min for the new id to appear.
           PRE_IDS="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
-            --branch "$TARGET" --event workflow_dispatch --limit 50 \
+            --branch "$TARGET" --event workflow_dispatch --limit 20 \
             --json databaseId --jq '[.[].databaseId]')" || PRE_IDS='[]'
           PRE_IDS="${PRE_IDS:-[]}"
 
@@ -142,7 +140,7 @@ jobs:
           for _attempt in $(seq 1 36); do
             sleep 5
             RUN_URL="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
-              --branch "$TARGET" --event workflow_dispatch --limit 50 \
+              --branch "$TARGET" --event workflow_dispatch --limit 20 \
               --json databaseId,url \
               | jq -r --argjson pre "$PRE_IDS" \
                   '[.[] | select(.databaseId as $id | ($pre | index($id) | not))] | sort_by(.databaseId) | last | .url // empty')" || true
