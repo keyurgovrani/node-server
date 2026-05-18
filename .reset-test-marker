@@ -1,0 +1,3 @@
+reset-release-branch ordering test
+2026-05-18: divergence commit so main HEAD != uat HEAD, making the next
+uat reset a discriminating test of the SOURCE-anchored tag fix (814861d).
