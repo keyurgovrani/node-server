@@ -1,5 +1,5 @@
 name: Reset Release Branch
-run-name: Reset ${{ inputs.target }} ← ${{ inputs.target == 'uat' && 'main' || 'uat' }}${{ inputs.trigger_build && ' and Build Apps' || '' }}
+run-name: Reset ${{ inputs.target }} ← ${{ inputs.target == 'uat' && 'main' || 'uat' }}
 
 on:
   workflow_dispatch:
@@ -9,10 +9,6 @@ on:
         required: true
         type: choice
         options: [uat, live]
-      trigger_build:
-        description: 'Trigger Build Apps after reset'
-        type: boolean
-        default: true
 
 concurrency:
   group: reset-${{ github.event.inputs.target }}
@@ -105,7 +101,7 @@ jobs:
           git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
 
           {
-            echo "### Reset $TARGET ← $SOURCE ($DATE_TAG)"
+            echo "### Reset $TARGET ← $SOURCE"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
@@ -113,44 +109,3 @@ jobs:
             echo "| Tag | \`$TAG\` |"
             echo "| Release | $(gh release view "$TAG" --json url -q .url || echo n/a) |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Trigger Build Apps
-        if: ${{ inputs.trigger_build }}
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-        run: |
-          set -euo pipefail
-          TARGET="${{ inputs.target }}"
-          if [[ "$TARGET" == "uat" ]]; then
-            BUILD_ENV="uat"
-          else
-            BUILD_ENV="prod"
-          fi
-
-          # Snapshot existing build-app run ids BEFORE dispatch. workflow_dispatch
-          # returns 204 with no run id. poll up to ~3 min for the new id to appear.
-          PRE_IDS="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
-            --branch "$TARGET" --event workflow_dispatch --limit 20 \
-            --json databaseId --jq '[.[].databaseId]')" || PRE_IDS='[]'
-          PRE_IDS="${PRE_IDS:-[]}"
-
-          gh workflow run build-app.yml --repo keyurgovrani/node-server --ref "$TARGET" -f env="$BUILD_ENV"
-
-          RUN_URL=""
-          for _attempt in $(seq 1 36); do
-            sleep 5
-            RUN_URL="$(gh run list --repo keyurgovrani/node-server --workflow build-app.yml \
-              --branch "$TARGET" --event workflow_dispatch --limit 20 \
-              --json databaseId,url \
-              | jq -r --argjson pre "$PRE_IDS" \
-                  '[.[] | select(.databaseId as $id | ($pre | index($id) | not))] | sort_by(.databaseId) | last | .url // empty')" || true
-            if [[ -n "$RUN_URL" ]]; then
-              break
-            fi
-          done
-
-          if [[ -n "$RUN_URL" ]]; then
-            echo "Triggered Build Apps on \`$TARGET\`: $RUN_URL" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Triggered Build Apps on \`$TARGET\` — run link unresolved; check Actions" >> "$GITHUB_STEP_SUMMARY"
-          fi
