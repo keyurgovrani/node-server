@@ -80,9 +80,7 @@ jobs:
           done
           git push origin "refs/remotes/origin/${TARGET}:refs/heads/${BACKUP}"
 
-          # 2. tag + GitHub release, anchored to SOURCE not the pre-reset
-          #    TARGET — GitHub sorts the Releases page by the tagged commit's
-          #    date, so a stale TARGET commit mis-orders releases. collision -> .NN
+          # 2. tag + GitHub release of the SOURCE (post-reset) state; collision -> .NN
           TAG="${TARGET}-${DATE_TAG}"
           if git ls-remote --tags --exit-code origin "$TAG" >/dev/null 2>&1; then
             n=1
