@@ -60,8 +60,14 @@ jobs:
           done
           git push origin "refs/remotes/origin/${TARGET}:refs/heads/${BACKUP}"
 
-          # 2. tag + release of SOURCE (post-reset HEAD); on collision append
-          #    .01, .02, … (the bare tag is tried first)
+          # 2. reset target := source (irreversible op first — if a branch rule
+          #    blocks the force-push, no tag/release phantom is left behind)
+          git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
+
+          # 3. tag + release the SOURCE (post-reset HEAD); on collision append
+          #    .01, .02, … (the bare tag is tried first). Tags the source commit,
+          #    which the force-push above does not move, so notes are identical
+          #    to tagging before the reset — only the failure mode differs.
           TAG="${TARGET}-${DATE_TAG}"
           if git ls-remote --tags --exit-code origin "$TAG" >/dev/null; then
             n=1
@@ -83,9 +89,6 @@ jobs:
             --generate-notes \
             ${PREV_TAG:+--notes-start-tag "$PREV_TAG"} \
             ${PRE[@]+"${PRE[@]}"}
-
-          # 3. reset target := source
-          git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
 
           {
             echo "### Reset $SOURCE → $TARGET"
