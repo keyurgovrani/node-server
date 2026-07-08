@@ -41,22 +41,28 @@ permissions:
   contents: write
   pull-requests: write
 
-# Dynamic run name that adapts based on how the workflow was triggered:
-# - Auto trigger (PR merge): "Cherry-pick #{pr_number} from {base_branch} to uat"
-# - Manual trigger with commit: "Cherry-pick {commit_hash} from {ref_name} to {target}"
-# - Manual trigger with PR: "Cherry-pick PR {pr_number} from {ref_name} to {target}"
+# Dynamic run name. The turnstyle queue token is the bracketed target ([uat]/[live]),
+# so a multi-target run must literally contain each target's [..] for serialization:
+# - Auto (PR merge): "Cherry-pick #<pr> from <base>" + " to [uat]" / " to [live]" /
+#   " to [uat] & [live]" (or nothing when no cherry-pick label is present).
+# - Manual (commit):  "Cherry-pick <hash> from <ref> to [<target>]"
+# - Manual (PR):      "Cherry-pick PR <pr> from <ref> to [<target>]"
 run-name: >-
   ${{
     github.event_name == 'pull_request'
       && format(
-          'Cherry-pick #{0} from {1} to uat',
+          'Cherry-pick #{0} from {1}{2}',
           github.event.pull_request.number,
-          github.event.pull_request.base.ref
+          github.event.pull_request.base.ref,
+          (contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT') && contains(github.event.pull_request.labels.*.name, 'Cherry-pick to Live')) && ' to [uat] & [live]'
+            || contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT') && ' to [uat]'
+            || contains(github.event.pull_request.labels.*.name, 'Cherry-pick to Live') && ' to [live]'
+            || ''
         )
       || (
         github.event.inputs.commit_hash != ''
           && format(
-              'Cherry-pick {0} from {1} to {2}',
+              'Cherry-pick {0} from {1} to [{2}]',
               github.event.inputs.commit_hash,
               github.ref_name,
               github.event.inputs.target_branch == 'custom'
@@ -65,7 +71,7 @@ run-name: >-
             )
       )
       || format(
-          'Cherry-pick PR {0} from {1} to {2}',
+          'Cherry-pick PR {0} from {1} to [{2}]',
           github.event.inputs.pr_number,
           github.ref_name,
           github.event.inputs.target_branch == 'custom'
@@ -75,10 +81,62 @@ run-name: >-
   }}
 
 jobs:
-  cherry-pick:
+  # Computes the list of target branches for this run and exposes it as a JSON
+  # array so the cherry-pick job can fan out over it via strategy.matrix.
+  # - PR merge: one entry per cherry-pick label present (uat and/or live).
+  # - Manual dispatch: a single entry (custom resolved + validated here).
+  prepare:
     if: |
-      (github.event_name == 'pull_request' && github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true &&
+        (contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT') ||
+         contains(github.event.pull_request.labels.*.name, 'Cherry-pick to Live'))) ||
       github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.compute.outputs.targets }}
+    steps:
+      - name: Compute target branches
+        id: compute
+        run: |
+          TARGETS=()
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT') }}" == "true" ]]; then
+              TARGETS+=("uat")
+            fi
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'Cherry-pick to Live') }}" == "true" ]]; then
+              TARGETS+=("live")
+            fi
+          else
+            TB=$(echo "${{ github.event.inputs.target_branch }}" | xargs)
+            if [[ "$TB" == "custom" ]]; then
+              CB=$(echo "${{ github.event.inputs.custom_target_branch }}" | xargs)
+              if [[ -z "$CB" ]]; then
+                echo "❌ Custom branch option selected but no custom branch name provided."
+                exit 1
+              fi
+              TARGETS+=("$CB")
+            else
+              TARGETS+=("$TB")
+            fi
+          fi
+
+          if [ ${#TARGETS[@]} -eq 0 ]; then
+            echo "targets=[]" >> "$GITHUB_OUTPUT"
+            echo "No target branches resolved."
+            exit 0
+          fi
+
+          JSON=$(printf '%s\n' "${TARGETS[@]}" | jq -R . | jq -cs .)
+          echo "targets=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Computed targets: $JSON"
+
+  cherry-pick:
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.targets != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
       - name: Sanitize and set input variables
@@ -89,13 +147,13 @@ jobs:
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             # AUTO TRIGGER PATH: PR merged with "Cherry-pick to UAT" label
             # - COMMIT_HASH: merge commit SHA from the PR that was just merged
-            # - TARGET_BRANCH: hardcoded to "uat" (auto cherry-picks always go to UAT)
+            # - TARGET_BRANCH: this matrix cell's target (resolved from labels by prepare)
             # - SOURCE_BRANCH: the base branch where PR was merged (typically "main")
             # - PR_NUMBER: the PR number for commenting back on the original PR
             # - TRIGGER_TYPE: tracks how workflow was triggered (for logging/commenting)
             COMMIT_HASH="${{ github.event.pull_request.merge_commit_sha }}"
-            TARGET_BRANCH="uat"
-            CUSTOM_TARGET_BRANCH=""
+            # TARGET_BRANCH: this matrix cell's target, resolved from labels by the prepare job
+            TARGET_BRANCH="${{ matrix.target }}"
             SOURCE_BRANCH="${{ github.event.pull_request.base.ref }}"
             PR_NUMBER="${{ github.event.pull_request.number }}"
             TRIGGER_TYPE="auto"
@@ -107,21 +165,19 @@ jobs:
             #   * Full URL: "https://github.com/unify-apps/www/pull/14642" → extracts "14642"
             #   * URL with path: "https://github.com/unify-apps/www/pull/14642/files" → extracts "14642"
             #   * grep -oE '[0-9]+': extracts first sequence of digits (the PR number)
-            # - TARGET_BRANCH: user-selected branch (uat/live/custom)
-            # - CUSTOM_TARGET_BRANCH: user-provided custom branch name (if "custom" was selected)
+            # - TARGET_BRANCH: this matrix cell's target (prepare resolved custom → actual name)
             # - SOURCE_BRANCH: the branch from which workflow was manually triggered
             # - xargs: trims whitespace from user inputs to prevent errors
             COMMIT_HASH=$(echo "${{ github.event.inputs.commit_hash }}" | xargs)
             PR_NUMBER=$(echo "${{ github.event.inputs.pr_number }}" | grep -oE '[0-9]+' || echo "")
-            TARGET_BRANCH=$(echo "${{ github.event.inputs.target_branch }}" | xargs)
-            CUSTOM_TARGET_BRANCH=$(echo "${{ github.event.inputs.custom_target_branch }}" | xargs)
+            # TARGET_BRANCH: this matrix cell's target (prepare resolved custom → actual name)
+            TARGET_BRANCH="${{ matrix.target }}"
             SOURCE_BRANCH=$(echo "${{ github.ref_name }}" | xargs)
             TRIGGER_TYPE="manual"
           fi
           
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
           echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
-          echo "custom_target_branch=$CUSTOM_TARGET_BRANCH" >> $GITHUB_OUTPUT
           echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "trigger_type=$TRIGGER_TYPE" >> $GITHUB_OUTPUT
@@ -205,7 +261,7 @@ jobs:
           echo ""
           echo "Trigger Type:      ${{ steps.input-vars.outputs.trigger_type }}"
           echo "Source Branch:     ${{ steps.input-vars.outputs.source_branch }}"
-          echo "Target Branch:     ${{ steps.input-vars.outputs.target_branch }}${{ steps.input-vars.outputs.target_branch == 'custom' && format(' → {0}', steps.input-vars.outputs.custom_target_branch) || '' }}"
+          echo "Target Branch:     ${{ steps.input-vars.outputs.target_branch }}"
           echo ""
           echo "Commit Hash:       ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
           
@@ -224,25 +280,12 @@ jobs:
       - name: Determine target branch
         id: resolved-target
         run: |
-          # Resolve the actual target branch name for cherry-picking
-          # This handles the "custom" option where users can specify any branch name
-          if [[ "${{ steps.input-vars.outputs.target_branch }}" == "custom" ]]; then
-            # User selected "custom" option - validate that they provided a custom branch name
-            # Without this check, the workflow would fail later with unclear error
-            if [[ -z "${{ steps.input-vars.outputs.custom_target_branch }}" ]]; then
-              echo "❌ Custom branch option selected but no custom branch name provided."
-              exit 1
-            fi
-            # Use the custom branch name provided by user
-            echo "branch=${{ steps.input-vars.outputs.custom_target_branch }}" >> $GITHUB_OUTPUT
-          else
-            # User selected a predefined option (uat/live) or auto-trigger (always uat)
-            # Use the target_branch value directly
-            echo "branch=${{ steps.input-vars.outputs.target_branch }}" >> $GITHUB_OUTPUT
-          fi
-
+          # Target branch is already fully resolved by the prepare job (custom names
+          # included). Re-export it under this step id so every downstream step can
+          # keep referencing steps.resolved-target.outputs.branch unchanged.
+          echo "branch=${{ matrix.target }}" >> $GITHUB_OUTPUT
           echo "Source branch (workflow triggered from): ${{ steps.input-vars.outputs.source_branch }}"
-          echo "Target branch (cherry-pick destination): $(cat $GITHUB_OUTPUT | grep branch= | cut -d= -f2)"
+          echo "Target branch (cherry-pick destination): ${{ matrix.target }}"
 
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -290,9 +333,11 @@ jobs:
         with:
           # turnstyle creates a durable in-workflow wait instead of GitHub's lossy single-pending concurrency slot.
           # Queue by destination branch so unrelated target branches can still process in parallel.
-          # queue-name must be a substring of the workflow's run-name (display_title) because
-          # turnstyle matches via `display_title.includes(queueName)`.
-          queue-name: to ${{ steps.resolved-target.outputs.branch }}
+          # queue-name must be a literal substring of the run-name (display_title) because turnstyle
+          # matches via `display_title.includes(queueName)`. The bracketed "[<branch>]" token is
+          # false-match-proof (a branch word like live-fix never contains "[live]") and lets a
+          # multi-target run embed both "[uat]" and "[live]" in one name.
+          queue-name: "[${{ steps.resolved-target.outputs.branch }}]"
           same-branch-only: false
           abort-after-seconds: 600
           poll-interval-seconds: 60
