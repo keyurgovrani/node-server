@@ -303,12 +303,27 @@ jobs:
           echo "Source branch (workflow triggered from): ${{ steps.input-vars.outputs.source_branch }}"
           echo "Target branch (cherry-pick destination): ${{ matrix.target }}"
 
+      - name: Validate target branch exists
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          TARGET: ${{ steps.resolved-target.outputs.branch }}
+        run: |
+          # Verify the target branch exists on remote before attempting cherry-pick
+          # This prevents wasting time on git operations that would fail later
+          # - gh api: hits the branch endpoint, so this can run BEFORE checkout —
+          #   which now takes `ref: <target>` and would otherwise fail first with a
+          #   raw git error, hiding the message below
+          # - Early exit prevents confusing error messages from git checkout/cherry-pick
+          if gh api "repos/${{ github.repository }}/branches/$TARGET" --silent 2>/dev/null; then
+            echo "✅ Target branch exists."
+          else
+            echo "❌ Branch '$TARGET' does not exist on remote!"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          # Only the target branch tip. Everything else this job needs is a
-          # named commit, fetched by SHA below — a full clone of a 36k-commit,
-          # 6.7k-branch repo to replay one diff is ~2 min of pure waste.
           ref: ${{ steps.resolved-target.outputs.branch }}
           fetch-depth: 1
           token: ${{ secrets.PAT }}
@@ -327,21 +342,6 @@ jobs:
             # Format: actor_id+actor@users.noreply.github.com
             git config --global user.name "${{ github.actor }}"
             git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
-          fi
-
-      - name: Validate target branch exists
-        run: |
-          # Verify the target branch exists on remote before attempting cherry-pick
-          # This prevents wasting time on git operations that would fail later
-          # - git ls-remote: queries remote repository for branch refs
-          # - grep -q: silently checks if branch name appears in output
-          # - Early exit prevents confusing error messages from git checkout/cherry-pick
-          if git ls-remote --heads origin ${{ steps.resolved-target.outputs.branch }} \
-            | grep -q "${{ steps.resolved-target.outputs.branch }}"; then
-            echo "✅ Target branch exists."
-          else
-            echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
-            exit 1
           fi
 
       - name: Wait for target branch queue
@@ -368,15 +368,14 @@ jobs:
           COMMIT: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
         run: |
           set -euo pipefail
-          # Re-read the target tip AFTER the queue above: another matrix cell or
-          # a parallel run may have pushed to this branch while we waited.
+          # Re-read the target tip: the queue above can hold this job while
+          # another cell pushes to the same branch.
           git fetch --depth=1 origin "$TARGET"
           git checkout -B "$TARGET" FETCH_HEAD
 
-          # depth=2, never 1. The steps below run `git rev-parse "$COMMIT^2"` to
-          # tell a merge commit from an ordinary one. At depth 1 the parents are
-          # cut off, every merge commit reads as ordinary, cherry-pick runs
-          # without -m 1 and fails. depth=2 keeps the parents visible.
+          # depth 2, not 1: merge detection below reads $COMMIT^2, and at depth 1
+          # the parents are cut off, so a merge commit reads as an ordinary one
+          # and cherry-pick runs without -m 1 and fails.
           git fetch --depth=2 origin "$COMMIT"
 
       - name: Find associated PR for commit
@@ -465,8 +464,7 @@ jobs:
           # to enumerate the actual rebased commits. Tip is guaranteed to
           # be merge_commit_sha; range is guaranteed linear post-rebase.
           N=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits')
-          # The walk below needs N ancestors present. The shallow fetch earlier
-          # only guaranteed 2, so deepen to N+1 before reading them.
+          # The walk below needs N ancestors; the fetch earlier guaranteed 2.
           git fetch --depth=$((N + 1)) origin "$MERGE_SHA"
           COMMITS=$(git log --reverse --first-parent --format=%H -n "$N" "$MERGE_SHA" | tr '\n' ' ' | xargs)
           echo "✅ Resolved $N rebased commits (tip: $MERGE_SHA)"
