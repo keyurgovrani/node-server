@@ -83,6 +83,9 @@ run-name: >-
         )
   }}
 
+env:
+  GH_TOKEN: ${{ secrets.PAT }}
+
 jobs:
   # Computes the list of target branches for this run and exposes it as a JSON
   # array so the cherry-pick job can fan out over it via strategy.matrix.
@@ -304,20 +307,16 @@ jobs:
           echo "Target branch (cherry-pick destination): ${{ matrix.target }}"
 
       - name: Validate target branch exists
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
-          TARGET: ${{ steps.resolved-target.outputs.branch }}
         run: |
           # Verify the target branch exists on remote before attempting cherry-pick
           # This prevents wasting time on git operations that would fail later
-          # - gh api: hits the branch endpoint, so this can run BEFORE checkout —
-          #   which now takes `ref: <target>` and would otherwise fail first with a
-          #   raw git error, hiding the message below
+          # - gh api: queries the branch endpoint, so this can run before checkout,
+          #   which takes `ref: <target>` and would otherwise fail there first
           # - Early exit prevents confusing error messages from git checkout/cherry-pick
-          if gh api "repos/${{ github.repository }}/branches/$TARGET" --silent 2>/dev/null; then
+          if gh api "repos/${{ github.repository }}/branches/${{ steps.resolved-target.outputs.branch }}" --silent 2>/dev/null; then
             echo "✅ Target branch exists."
           else
-            echo "❌ Branch '$TARGET' does not exist on remote!"
+            echo "❌ Branch '${{ steps.resolved-target.outputs.branch }}' does not exist on remote!"
             exit 1
           fi
 
@@ -455,7 +454,6 @@ jobs:
         env:
           MERGE_SHA: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
           PR_NUMBER: ${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}
-          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           # Rebase rewrites every commit SHA (new parent → new SHA), so
           # listCommits(PR) would return PRE-rebase SHAs that don't exist
