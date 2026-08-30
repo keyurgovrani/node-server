@@ -1,0 +1,8 @@
+name: Check TypeScript Types
+description: Stand-in for the www check-tsc action so the step topology matches this repo
+runs:
+  using: composite
+  steps:
+    - name: check types
+      shell: bash
+      run: node --check index.js

@@ -4,23 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       commit_hash:
-        description: "Commit hash to cherry-pick (required if pr_number is not provided)"
+        description: 'Commit hash to cherry-pick (required if pr_number is not provided)'
         required: false
         type: string
-      
+
       pr_number:
-        description: "PR number or link to cherry-pick (required if commit_hash is not provided)"
+        description: 'PR number or link to cherry-pick (required if commit_hash is not provided)'
         required: false
         type: string
 
       target_branch:
-        description: "Target branch for cherry-pick"
+        description: 'Target branch for cherry-pick'
         required: true
         type: choice
-        default: "uat"
+        default: 'uat'
         options:
           - uat
           - live
+          - uat & live      # new — fans out to both uat and live
           - custom
 
       custom_target_branch:
@@ -46,7 +47,9 @@ permissions:
 # - Auto (PR merge): "Cherry-pick #<pr> from <base>" + " to [uat]" / " to [live]" /
 #   " to [uat] & [live]" (or nothing when no cherry-pick label is present).
 # - Manual (commit):  "Cherry-pick <hash> from <ref> to [<target>]"
+#   (combined 'uat & live' selection renders " to [uat] & [live]").
 # - Manual (PR):      "Cherry-pick PR <pr> from <ref> to [<target>]"
+#   (combined 'uat & live' selection renders " to [uat] & [live]").
 run-name: >-
   ${{
     github.event_name == 'pull_request'
@@ -62,21 +65,21 @@ run-name: >-
       || (
         github.event.inputs.commit_hash != ''
           && format(
-              'Cherry-pick {0} from {1} to [{2}]',
+              'Cherry-pick {0} from {1}{2}',
               github.event.inputs.commit_hash,
               github.ref_name,
-              github.event.inputs.target_branch == 'custom'
-                && github.event.inputs.custom_target_branch
-                || github.event.inputs.target_branch
+              github.event.inputs.target_branch == 'uat & live' && ' to [uat] & [live]'
+                || github.event.inputs.target_branch == 'custom' && format(' to [{0}]', github.event.inputs.custom_target_branch)
+                || format(' to [{0}]', github.event.inputs.target_branch)
             )
       )
       || format(
-          'Cherry-pick PR {0} from {1} to [{2}]',
+          'Cherry-pick PR {0} from {1}{2}',
           github.event.inputs.pr_number,
           github.ref_name,
-          github.event.inputs.target_branch == 'custom'
-            && github.event.inputs.custom_target_branch
-            || github.event.inputs.target_branch
+          github.event.inputs.target_branch == 'uat & live' && ' to [uat] & [live]'
+            || github.event.inputs.target_branch == 'custom' && format(' to [{0}]', github.event.inputs.custom_target_branch)
+            || format(' to [{0}]', github.event.inputs.target_branch)
         )
   }}
 
@@ -84,7 +87,8 @@ jobs:
   # Computes the list of target branches for this run and exposes it as a JSON
   # array so the cherry-pick job can fan out over it via strategy.matrix.
   # - PR merge: one entry per cherry-pick label present (uat and/or live).
-  # - Manual dispatch: a single entry (custom resolved + validated here).
+  # - Manual dispatch: one entry, or two for the 'uat & live' option
+  #   (custom resolved + validated here).
   prepare:
     if: |
       (github.event_name == 'pull_request' && github.event.pull_request.merged == true &&
@@ -100,6 +104,7 @@ jobs:
         run: |
           TARGETS=()
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # Auto path: derive targets from the cherry-pick labels present at merge.
             if [[ "${{ contains(github.event.pull_request.labels.*.name, 'Cherry-pick to UAT') }}" == "true" ]]; then
               TARGETS+=("uat")
             fi
@@ -107,6 +112,8 @@ jobs:
               TARGETS+=("live")
             fi
           else
+            # Manual path: a single target. Resolve + validate custom here so the
+            # matrix cell downstream always receives a concrete branch name.
             TB=$(echo "${{ github.event.inputs.target_branch }}" | xargs)
             if [[ "$TB" == "custom" ]]; then
               CB=$(echo "${{ github.event.inputs.custom_target_branch }}" | xargs)
@@ -115,11 +122,18 @@ jobs:
                 exit 1
               fi
               TARGETS+=("$CB")
+            elif [[ "$TB" == "uat & live" ]]; then
+              # Combined option: fan out to both, mirroring an auto PR that carries
+              # both cherry-pick labels. Matrix (fail-fast:false) keeps them independent.
+              TARGETS+=("uat")
+              TARGETS+=("live")
             else
               TARGETS+=("$TB")
             fi
           fi
 
+          # Defensive: the job `if` guarantees at least one target, but never emit a
+          # bare/empty element — output [] so the cherry-pick job's guard skips it.
           if [ ${#TARGETS[@]} -eq 0 ]; then
             echo "targets=[]" >> "$GITHUB_OUTPUT"
             echo "No target branches resolved."
@@ -132,7 +146,9 @@ jobs:
 
   cherry-pick:
     needs: prepare
+    # Skip when prepare was skipped (no cherry-pick label) or produced no targets.
     if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.targets != '[]' }}
+    # fail-fast:false → a uat conflict must never cancel the live cell (and vice versa).
     strategy:
       fail-fast: false
       matrix:
@@ -170,12 +186,12 @@ jobs:
             # - xargs: trims whitespace from user inputs to prevent errors
             COMMIT_HASH=$(echo "${{ github.event.inputs.commit_hash }}" | xargs)
             PR_NUMBER=$(echo "${{ github.event.inputs.pr_number }}" | grep -oE '[0-9]+' || echo "")
-            # TARGET_BRANCH: this matrix cell's target (prepare resolved custom → actual name)
+            # TARGET_BRANCH: this matrix cell's target (prepare already resolved custom → real name)
             TARGET_BRANCH="${{ matrix.target }}"
             SOURCE_BRANCH=$(echo "${{ github.ref_name }}" | xargs)
             TRIGGER_TYPE="manual"
           fi
-          
+
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
           echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
           echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
@@ -243,14 +259,14 @@ jobs:
         if: steps.input-vars.outputs.trigger_type == 'manual'
         run: |
           COMMIT_HASH="${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
-          
+
           if [[ -z "$COMMIT_HASH" ]]; then
             echo "❌ Error: Either commit_hash or pr_number must be provided."
             echo "   - Provide a commit SHA directly, OR"
             echo "   - Provide a PR number/link to cherry-pick its merge commit"
             exit 1
           fi
-          
+
           echo "✅ Commit hash validated: $COMMIT_HASH"
 
       - name: Print final sanitized inputs
@@ -264,16 +280,16 @@ jobs:
           echo "Target Branch:     ${{ steps.input-vars.outputs.target_branch }}"
           echo ""
           echo "Commit Hash:       ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
-          
+
           if [[ -n "${{ steps.input-vars.outputs.pr_number }}" ]]; then
             echo "PR Number:         #${{ steps.input-vars.outputs.pr_number }}"
           fi
-          
+
           if [[ -n "${{ steps.resolve-commit.outputs.pr_title }}" ]]; then
             echo "PR Title:          ${{ steps.resolve-commit.outputs.pr_title }}"
             echo "PR Base Branch:    ${{ steps.resolve-commit.outputs.base_branch }}"
           fi
-          
+
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -385,16 +401,16 @@ jobs:
           # Priority: final-commit (from PR) > input-vars (direct commit hash)
           COMMIT="${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
           PR_NUMBER="${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}"
-          
+
           # Get commit message to detect merge type
           COMMIT_MSG=$(git log --format=%B -n 1 "$COMMIT")
           echo "Commit message: $COMMIT_MSG"
-          
+
           # MERGE TYPE DETECTION:
           # - Squash and Merge: commit message contains (#PR_NUMBER)
           # - Rebase and Merge: commit message does not contain (#PR_NUMBER)
           # - Merge Commit: has multiple parents (detected by git rev-parse)
-          
+
           # MERGE COMMIT DETECTION
           # Merge commits have multiple parents and require special handling
           # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
@@ -455,14 +471,14 @@ jobs:
             COMMIT_COUNT="1"
             echo "Cherry-picking single commit"
           fi
-          
+
           echo "Merge Type: ${{ steps.detect-merge.outputs.merge_type }}"
           echo "Commits: $COMMITS"
           echo ""
-          
+
           # Track if any cherry-pick fails
           PICK_FAILED=false
-          
+
           # Cherry-pick each commit in order
           for COMMIT in $COMMITS; do
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -508,7 +524,7 @@ jobs:
             fi
             echo ""
           done
-          
+
           if [[ "$PICK_FAILED" == "true" ]]; then
             # Cherry-pick failed - could be conflicts or other git errors
             echo "status=failed" >> $GITHUB_OUTPUT
@@ -519,8 +535,38 @@ jobs:
             echo "✅ All commits cherry-picked successfully"
           fi
 
-      - name: Push to target branch
+      - name: Run TypeScript type check
+        id: check-tsc
         if: steps.cherry-pick.outputs.status == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/check-tsc
+
+      - name: Handle TypeScript check failure
+        if: steps.cherry-pick.outputs.status == 'success' && steps.check-tsc.outcome == 'failure'
+        run: |
+          echo "❌ TypeScript type check failed after cherry-pick"
+          echo ""
+          echo "The cherry-picked commits introduce TypeScript errors."
+          echo "Reverting cherry-picks and aborting..."
+          echo ""
+
+          # Revert all cherry-picked commits
+          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "Rebase and Merge" ]]; then
+            COMMIT_COUNT="${{ steps.get-rebase-commits.outputs.commit_count }}"
+            echo "Reverting $COMMIT_COUNT commits..."
+            git reset --hard HEAD~$COMMIT_COUNT
+          else
+            echo "Reverting 1 commit..."
+            git reset --hard HEAD~1
+          fi
+
+          echo ""
+          echo "Cherry-picks reverted. The target branch remains unchanged."
+          exit 1
+
+      - name: Push to target branch
+        id: push
+        if: steps.cherry-pick.outputs.status == 'success' && steps.check-tsc.outcome == 'success'
         run: |
           git push origin ${{ steps.resolved-target.outputs.branch }}
 
@@ -550,6 +596,8 @@ jobs:
             // Use resolved commit hash if available, otherwise use direct input
             const commitHash = "${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}";
             const cherryPickStatus = "${{ steps.cherry-pick.outputs.status }}";
+            const tscCheckOutcome = "${{ steps.check-tsc.outcome }}";
+            const pushOutcome = "${{ steps.push.outcome }}";
             const triggerType = "${{ steps.input-vars.outputs.trigger_type }}";
             const mergeType = "${{ steps.detect-merge.outputs.merge_type }}";
             const commitCount = "${{ steps.get-rebase-commits.outputs.commit_count || '1' }}";
@@ -558,16 +606,22 @@ jobs:
             // Prefix indicates how workflow was triggered (helps users understand context)
             const prefix = triggerType === 'auto' ? '**Auto Cherry-pick**' : '**Manual Cherry-pick**';
             // Add merge type info for debugging
-            const mergeInfo = mergeType ? `\nMerge type: ${mergeType}${mergeType === 'Rebase and Merge' ? ` (${commitCount} commits)` : ''}` : '';
-            
+            const mergeInfo = `\nMerge type: ${mergeType}`;
+
             // Determine failure reason and build appropriate message
-            if (cherryPickStatus === "success") {
+            if (cherryPickStatus === "success" && tscCheckOutcome === "success" && pushOutcome === "success") {
               const commitInfo = mergeType === 'Rebase and Merge' 
                 ? `${commitCount} commits from PR #${prNumber} have been` 
                 : `Commit \`${commitHash}\` has been`;
               comment = `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${mergeInfo}`;
-            } else {
+            } else if (cherryPickStatus === "success" && tscCheckOutcome === "success" && pushOutcome === "failure") {
+              comment = `❌ ${prefix}\n\n**Push failed** after cherry-picking to the \`${targetBranch}\` branch.\n\nThe cherry-pick succeeded locally but failed to push due to stale ref (remote branch has new commits). \n\nPlease re-run the workflow to cherry-pick the commits again.`;
+            } else if (cherryPickStatus === "success" && tscCheckOutcome === "failure") {
+              comment = `❌ ${prefix}\n\n**TypeScript type check failed** after cherry-picking.\n\nThe cherry-picked changes introduce TypeScript errors. Cherry-pick was **reverted** and the \`${targetBranch}\` branch remains unchanged.\n\nPlease fix the TypeScript errors before cherry-picking.${mergeInfo}`;
+            } else if (cherryPickStatus === "failed") {
               comment = `❌ ${prefix}\n\n**Merge conflicts detected** while cherry-picking to the \`${targetBranch}\` branch.\n\nManual intervention required to resolve conflicts.${mergeInfo}`;
+            } else {
+              comment = `❌ ${prefix}\n\nFailed to cherry-pick to the \`${targetBranch}\` branch. Check workflow logs for details.${mergeInfo}`;
             }
 
             comment += `\n\n[View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
@@ -588,9 +642,8 @@ jobs:
         run: echo "ℹ️ No associated PR found for commit ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}."
 
       - name: Handle cherry-pick failure
-        if: steps.cherry-pick.outputs.status == 'failed'
+        if: steps.cherry-pick.outputs.status == 'failed' || steps.check-tsc.outcome == 'failure'
         run: |
           echo "Cherry-pick failed"
           echo "Manual cherry-pick may be required"
           exit 1
-          
