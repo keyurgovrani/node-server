@@ -547,7 +547,7 @@ jobs:
             echo "✅ All commits cherry-picked successfully"
           fi
 
-      - name: Run TypeScript type check
+      - name: Check TypeScript Types
         id: check-tsc
         if: steps.cherry-pick.outputs.status == 'success'
         continue-on-error: true
