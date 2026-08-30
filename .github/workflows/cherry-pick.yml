@@ -306,7 +306,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          # Only the target branch tip. Everything else this job needs is a
+          # named commit, fetched by SHA below — a full clone of a 36k-commit,
+          # 6.7k-branch repo to replay one diff is ~2 min of pure waste.
+          ref: ${{ steps.resolved-target.outputs.branch }}
+          fetch-depth: 1
           token: ${{ secrets.PAT }}
 
       - name: Configure Git
@@ -358,13 +362,22 @@ jobs:
           abort-after-seconds: 600
           poll-interval-seconds: 60
 
-      - name: Fetch all branches
-        run: git fetch --all
-
-      - name: Checkout target branch
+      - name: Refresh target branch and fetch the source commit
+        env:
+          TARGET: ${{ steps.resolved-target.outputs.branch }}
+          COMMIT: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
         run: |
-          git checkout ${{ steps.resolved-target.outputs.branch }}
-          git pull origin ${{ steps.resolved-target.outputs.branch }}
+          set -euo pipefail
+          # Re-read the target tip AFTER the queue above: another matrix cell or
+          # a parallel run may have pushed to this branch while we waited.
+          git fetch --depth=1 origin "$TARGET"
+          git checkout -B "$TARGET" FETCH_HEAD
+
+          # depth=2, never 1. The steps below run `git rev-parse "$COMMIT^2"` to
+          # tell a merge commit from an ordinary one. At depth 1 the parents are
+          # cut off, every merge commit reads as ordinary, cherry-pick runs
+          # without -m 1 and fails. depth=2 keeps the parents visible.
+          git fetch --depth=2 origin "$COMMIT"
 
       - name: Find associated PR for commit
         # Only run for manual triggers when commit was provided directly (not from PR input)
@@ -452,6 +465,9 @@ jobs:
           # to enumerate the actual rebased commits. Tip is guaranteed to
           # be merge_commit_sha; range is guaranteed linear post-rebase.
           N=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits')
+          # The walk below needs N ancestors present. The shallow fetch earlier
+          # only guaranteed 2, so deepen to N+1 before reading them.
+          git fetch --depth=$((N + 1)) origin "$MERGE_SHA"
           COMMITS=$(git log --reverse --first-parent --format=%H -n "$N" "$MERGE_SHA" | tr '\n' ' ' | xargs)
           echo "✅ Resolved $N rebased commits (tip: $MERGE_SHA)"
           echo "Commits to cherry-pick: $COMMITS"
