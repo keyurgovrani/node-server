@@ -539,7 +539,9 @@ jobs:
         id: check-tsc
         if: steps.cherry-pick.outputs.status == 'success'
         continue-on-error: true
-        uses: ./.github/actions/check-tsc
+        # www runs its real tsc action here. This repo only needs a gate that can
+        # pass or fail, so the push/revert paths below stay exercised.
+        run: node --check index.js
 
       - name: Handle TypeScript check failure
         if: steps.cherry-pick.outputs.status == 'success' && steps.check-tsc.outcome == 'failure'
