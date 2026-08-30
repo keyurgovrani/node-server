@@ -188,6 +188,13 @@ jobs:
             # - SOURCE_BRANCH: the branch from which workflow was manually triggered
             # - xargs: trims whitespace from user inputs to prevent errors
             COMMIT_HASH=$(echo "${{ github.event.inputs.commit_hash }}" | xargs)
+            # Expand to the full 40-char SHA. People paste abbreviated hashes, and
+            # `git fetch origin <sha>` reads anything shorter as a ref name and
+            # fails with "couldn't find remote ref". Left as typed if unresolvable,
+            # so a bogus hash still fails where it did before.
+            if [[ -n "$COMMIT_HASH" ]]; then
+              COMMIT_HASH=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_HASH" --jq .sha 2>/dev/null || echo "$COMMIT_HASH")
+            fi
             PR_NUMBER=$(echo "${{ github.event.inputs.pr_number }}" | grep -oE '[0-9]+' || echo "")
             # TARGET_BRANCH: this matrix cell's target (prepare already resolved custom → real name)
             TARGET_BRANCH="${{ matrix.target }}"
