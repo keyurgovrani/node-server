@@ -414,96 +414,104 @@ jobs:
 
       - name: Detect merge type and get commits to cherry-pick
         id: detect-merge
-        run: |
-          # Use resolved commit hash from PR if available, otherwise use direct input
-          # Priority: final-commit (from PR) > input-vars (direct commit hash)
-          COMMIT="${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}"
-          PR_NUMBER="${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}"
-
-          # Get commit message to detect merge type
-          COMMIT_MSG=$(git log --format=%B -n 1 "$COMMIT")
-          echo "Commit message: $COMMIT_MSG"
-
-          # MERGE TYPE DETECTION:
-          # - Squash and Merge: commit message contains (#PR_NUMBER)
-          # - Rebase and Merge: commit message does not contain (#PR_NUMBER)
-          # - Merge Commit: has multiple parents (detected by git rev-parse)
-
-          # MERGE COMMIT DETECTION
-          # Merge commits have multiple parents and require special handling
-          # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
-          # - ^2 notation: refers to the second parent of a commit
-          # - If second parent exists: it's a merge commit, use -m 1 flag
-          # - -m 1: tells git to use the first parent as the mainline (preserves merge changes)
-          # - Without -m 1: git doesn't know which parent to use and cherry-pick fails
-          if git rev-parse --verify "$COMMIT^2" >/dev/null 2>&1; then
-            echo "merge_type=Merge Commit" >> $GITHUB_OUTPUT
-            echo "commits=$COMMIT" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Merge Commit (multiple parents)"
-          elif echo "$COMMIT_MSG" | grep -q "(#$PR_NUMBER)"; then
-            # Commit message contains (#PR_NUMBER) = squash merge
-            echo "merge_type=Squash and Merge" >> $GITHUB_OUTPUT
-            echo "commits=$COMMIT" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Squash and Merge (contains #$PR_NUMBER in message)"
-          else
-            # No (#PR_NUMBER) in message = rebase merge, need all PR commits
-            echo "merge_type=Rebase and Merge" >> $GITHUB_OUTPUT
-            echo "✅ Detected: Rebase and Merge (no #$PR_NUMBER in message)"
-            
-            # For rebase merges, we need to get all commits from the PR
-            # These commits are now part of the base branch's history
-            echo "Fetching all commits from PR #$PR_NUMBER..."
-          fi
-
-      - name: Get all commits for rebase merge
-        if: steps.detect-merge.outputs.merge_type == 'Rebase and Merge'
-        id: get-rebase-commits
         env:
-          MERGE_SHA: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
+          COMMIT: ${{ steps.final-commit.outputs.commit_hash || steps.input-vars.outputs.commit_hash }}
           PR_NUMBER: ${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}
         run: |
-          # Rebase rewrites every commit SHA (new parent → new SHA), so
-          # listCommits(PR) would return PRE-rebase SHAs that don't exist
-          # on main. Instead: ask API only for the commit count N, then
-          # walk first-parent back N steps from merge_commit_sha on main
-          # to enumerate the actual rebased commits. Tip is guaranteed to
-          # be merge_commit_sha; range is guaranteed linear post-rebase.
+          set -euo pipefail
+          # Detection reads commit STRUCTURE only, never the message. The message is
+          # whatever the merger typed: www PR #29948 was squashed under a
+          # "Merge pull request #…" subject, the old "(#N) in message" rule read it
+          # as a rebase, walked one commit too far into main and died on an empty
+          # pick. Each merge method leaves a footprint nobody can edit:
+          #   Merge commit → two parents.
+          #   Rebase       → the PR's commits copied onto main; author email, author
+          #                  timestamp and subject survive verbatim, only the SHA moves.
+          #   Squash       → one new commit whose author timestamp is the merge time,
+          #                  so it never equals any PR commit's.
+          # So: two parents = merge. Otherwise walk main's first-parent line from the
+          # tip and collect commits whose (email|author time|subject) fingerprint is a
+          # PR commit's: N matches = rebase, zero = squash, anything else = stop.
+
+          if git rev-parse --verify --quiet "$COMMIT^2" >/dev/null; then
+            echo "merge_type=Merge Commit" >> "$GITHUB_OUTPUT"
+            echo "commits=$COMMIT" >> "$GITHUB_OUTPUT"
+            echo "commit_count=1" >> "$GITHUB_OUTPUT"
+            echo "✅ Detected: Merge Commit (two parents) → cherry-pick with -m 1"
+            exit 0
+          fi
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            # A bare commit hash with no PR behind it: nothing to fingerprint
+            # against, so rebase and plain commit look the same. Pick just this one.
+            echo "merge_type=Single Commit" >> "$GITHUB_OUTPUT"
+            echo "commits=$COMMIT" >> "$GITHUB_OUTPUT"
+            echo "commit_count=1" >> "$GITHUB_OUTPUT"
+            echo "✅ No associated PR → cherry-pick the single commit"
+            exit 0
+          fi
+
           N=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits')
-          # The walk below needs N ancestors; the fetch earlier guaranteed 2.
-          git fetch --depth=$((N + 1)) origin "$MERGE_SHA"
-          COMMITS=$(git log --reverse --first-parent --format=%H -n "$N" "$MERGE_SHA" | tr '\n' ' ' | xargs)
-          echo "✅ Resolved $N rebased commits (tip: $MERGE_SHA)"
-          echo "Commits to cherry-pick: $COMMITS"
-          echo "commits=$COMMITS" >> $GITHUB_OUTPUT
-          echo "commit_count=$N" >> $GITHUB_OUTPUT
+          # refs/pull/N/head outlives the branch (delete-branch-on-merge included),
+          # so the PR's own commits are always fetchable. Depth N covers exactly the
+          # PR range; depth N+1 on the tip covers N rebased commits plus the commit
+          # before them, which the walk below must see NOT match.
+          git fetch --depth="$N" origin "refs/pull/$PR_NUMBER/head:refs/remotes/pr/$PR_NUMBER"
+          git fetch --depth=$((N + 1)) origin "$COMMIT"
+
+          PR_KEYS=$(git log --first-parent -n "$N" --format='%ae|%at|%s' "refs/remotes/pr/$PR_NUMBER")
+          echo "PR #$PR_NUMBER has $N commit(s):"
+          sed 's/^/  /' <<<"$PR_KEYS"
+
+          # The walk runs newest→oldest; prepending keeps PICKS oldest-first, the
+          # order the commits landed on main and the order they must replay.
+          PICKS=()
+          while read -r SHA KEY; do
+            grep -qxF -- "$KEY" <<<"$PR_KEYS" || break
+            PICKS=("$SHA" ${PICKS[@]+"${PICKS[@]}"})
+          done < <(git log --first-parent -n $((N + 1)) --format='%H %ae|%at|%s' "$COMMIT")
+          MATCHED=${#PICKS[@]}
+
+          if [[ "$MATCHED" -eq 0 ]]; then
+            echo "merge_type=Squash and Merge" >> "$GITHUB_OUTPUT"
+            echo "commits=$COMMIT" >> "$GITHUB_OUTPUT"
+            echo "commit_count=1" >> "$GITHUB_OUTPUT"
+            echo "✅ Detected: Squash and Merge (tip matches no PR commit) → cherry-pick $COMMIT"
+          elif [[ "$MATCHED" -eq "$N" ]]; then
+            COMMITS="${PICKS[*]}"
+            echo "merge_type=Rebase and Merge" >> "$GITHUB_OUTPUT"
+            echo "commits=$COMMITS" >> "$GITHUB_OUTPUT"
+            echo "commit_count=$N" >> "$GITHUB_OUTPUT"
+            echo "✅ Detected: Rebase and Merge ($N commits match PR fingerprints)"
+            echo "Commits to cherry-pick: $COMMITS"
+          else
+            echo "❌ Matched $MATCHED of $N PR commits walking back from $COMMIT."
+            echo "   The tip is not the PR's merge commit, or main's history was rewritten."
+            echo "   Cherry-pick the commits by hand."
+            exit 1
+          fi
 
       - name: Cherry-pick commits to target branch
         id: cherry-pick
+        env:
+          MERGE_TYPE: ${{ steps.detect-merge.outputs.merge_type }}
+          COMMITS: ${{ steps.detect-merge.outputs.commits }}
+          COMMIT_COUNT: ${{ steps.detect-merge.outputs.commit_count }}
         run: |
-          # Get commits to cherry-pick based on merge type
-          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "Rebase and Merge" ]]; then
-            COMMITS="${{ steps.get-rebase-commits.outputs.commits }}"
-            COMMIT_COUNT="${{ steps.get-rebase-commits.outputs.commit_count }}"
-            echo "Cherry-picking $COMMIT_COUNT commits from rebased PR"
-          else
-            COMMITS="${{ steps.detect-merge.outputs.commits }}"
-            COMMIT_COUNT="1"
-            echo "Cherry-picking single commit"
-          fi
-
-          echo "Merge Type: ${{ steps.detect-merge.outputs.merge_type }}"
-          echo "Commits: $COMMITS"
+          echo "Merge Type: $MERGE_TYPE"
+          echo "Cherry-picking $COMMIT_COUNT commit(s): $COMMITS"
           echo ""
 
-          # Track if any cherry-pick fails
           PICK_FAILED=false
+          PICKED=0
+          SKIPPED=0
 
           # Cherry-pick each commit in order
           for COMMIT in $COMMITS; do
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "Cherry-picking: $COMMIT"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            
+
             # MERGE COMMIT DETECTION
             # Merge commits have multiple parents and require special handling
             # - git rev-parse --verify "$COMMIT^2": checks if second parent exists
@@ -519,30 +527,42 @@ jobs:
               echo "Normal commit → standard cherry-pick"
               PICK_CMD="git cherry-pick $COMMIT"
             fi
-            
+
             echo "Running: $PICK_CMD"
             # EXECUTE CHERRY-PICK
             # Capture success/failure status for later steps (push, comment, etc.)
             if $PICK_CMD; then
               echo "✅ Cherry-pick successful for $COMMIT"
+              PICKED=$((PICKED + 1))
+            elif [[ -z "$(git diff --name-only --diff-filter=U)" ]] && git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+              # No unmerged paths but the sequencer is still parked: the pick came
+              # out EMPTY, i.e. the change is already on the target (someone
+              # cherry-picked by hand before this run). Not a failure; skip it.
+              echo "ℹ️ Empty pick: $COMMIT is already on the target branch → skipping"
+              git cherry-pick --skip
+              SKIPPED=$((SKIPPED + 1))
             else
               echo "❌ Cherry-pick failed for $COMMIT"
               PICK_FAILED=true
-              
+
               # CONFLICT DETECTION AND CLEANUP
-              # - git status --porcelain: machine-readable git status
-              # - ^UU: "unmerged, both modified" status code indicates merge conflict
+              # - --diff-filter=U lists every unmerged path, whatever the flavour
+              #   (both-modified UU, both-added AA, deleted-by-one DU/UD). The old
+              #   "^UU" grep missed add/add and left the sequencer parked.
               # - Abort cherry-pick to leave repo in clean state for manual intervention
               # - Without abort: repo stays in conflicted state, blocking other operations
-              if git status --porcelain | grep -q "^UU"; then
+              if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
                 echo "Conflicts detected → aborting cherry-pick"
                 git cherry-pick --abort
               fi
-              
+
               break
             fi
             echo ""
           done
+
+          echo "picked_count=$PICKED" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED" >> $GITHUB_OUTPUT
 
           if [[ "$PICK_FAILED" == "true" ]]; then
             # Cherry-pick failed - could be conflicts or other git errors
@@ -551,7 +571,7 @@ jobs:
           else
             # Cherry-pick succeeded - set output for downstream steps
             echo "status=success" >> $GITHUB_OUTPUT
-            echo "✅ All commits cherry-picked successfully"
+            echo "✅ Done: $PICKED picked, $SKIPPED already present"
           fi
 
       - name: Check TypeScript Types
@@ -571,14 +591,12 @@ jobs:
           echo "Reverting cherry-picks and aborting..."
           echo ""
 
-          # Revert all cherry-picked commits
-          if [[ "${{ steps.detect-merge.outputs.merge_type }}" == "Rebase and Merge" ]]; then
-            COMMIT_COUNT="${{ steps.get-rebase-commits.outputs.commit_count }}"
-            echo "Reverting $COMMIT_COUNT commits..."
-            git reset --hard HEAD~$COMMIT_COUNT
-          else
-            echo "Reverting 1 commit..."
-            git reset --hard HEAD~1
+          # Revert exactly what this run created. Picks that came out empty made
+          # no commit, so the detected count would over-reset into target history.
+          PICKED="${{ steps.cherry-pick.outputs.picked_count }}"
+          echo "Reverting $PICKED commit(s)..."
+          if [[ "$PICKED" -gt 0 ]]; then
+            git reset --hard "HEAD~$PICKED"
           fi
 
           echo ""
@@ -621,7 +639,9 @@ jobs:
             const pushOutcome = "${{ steps.push.outcome }}";
             const triggerType = "${{ steps.input-vars.outputs.trigger_type }}";
             const mergeType = "${{ steps.detect-merge.outputs.merge_type }}";
-            const commitCount = "${{ steps.get-rebase-commits.outputs.commit_count || '1' }}";
+            const commitCount = "${{ steps.detect-merge.outputs.commit_count || '1' }}";
+            const pickedCount = Number("${{ steps.cherry-pick.outputs.picked_count || '0' }}");
+            const skippedCount = Number("${{ steps.cherry-pick.outputs.skipped_count || '0' }}");
 
             let comment = '';
             // Prefix indicates how workflow was triggered (helps users understand context)
@@ -631,10 +651,17 @@ jobs:
 
             // Determine failure reason and build appropriate message
             if (cherryPickStatus === "success" && tscCheckOutcome === "success" && pushOutcome === "success") {
-              const commitInfo = mergeType === 'Rebase and Merge' 
-                ? `${commitCount} commits from PR #${prNumber} have been` 
+              const commitInfo = mergeType === 'Rebase and Merge'
+                ? `${commitCount} commits from PR #${prNumber} have been`
                 : `Commit \`${commitHash}\` has been`;
-              comment = `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${mergeInfo}`;
+              // Empty picks mean the change was already on the target; say so
+              // instead of claiming this run landed it.
+              const skipInfo = skippedCount > 0
+                ? `\n\n${skippedCount} of ${commitCount} commit(s) were already present on \`${targetBranch}\` and were skipped.`
+                : '';
+              comment = pickedCount === 0
+                ? `✅ ${prefix}\n\nNothing to do: the change is already on the \`${targetBranch}\` branch.${mergeInfo}`
+                : `✅ ${prefix}\n\n${commitInfo} successfully cherry-picked to the \`${targetBranch}\` branch.${skipInfo}${mergeInfo}`;
             } else if (cherryPickStatus === "success" && tscCheckOutcome === "success" && pushOutcome === "failure") {
               comment = `❌ ${prefix}\n\n**Push failed** after cherry-picking to the \`${targetBranch}\` branch.\n\nThe cherry-pick succeeded locally but failed to push due to stale ref (remote branch has new commits). \n\nPlease re-run the workflow to cherry-pick the commits again.`;
             } else if (cherryPickStatus === "success" && tscCheckOutcome === "failure") {
