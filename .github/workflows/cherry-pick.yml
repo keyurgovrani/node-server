@@ -419,11 +419,8 @@ jobs:
           PR_NUMBER: ${{ steps.input-vars.outputs.pr_number || steps.find-pr.outputs.pr_number }}
         run: |
           set -euo pipefail
-          # Detection reads commit STRUCTURE only, never the message. The message is
-          # whatever the merger typed: www PR #29948 was squashed under a
-          # "Merge pull request #…" subject, the old "(#N) in message" rule read it
-          # as a rebase, walked one commit too far into main and died on an empty
-          # pick. Each merge method leaves a footprint nobody can edit:
+          # Detection reads commit STRUCTURE only, never the message: the subject is
+          # whatever the merger typed. Each merge method leaves a footprint nobody can edit:
           #   Merge commit → two parents.
           #   Rebase       → the PR's commits copied onto main; author email, author
           #                  timestamp and subject survive verbatim, only the SHA moves.
