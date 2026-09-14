@@ -648,13 +648,14 @@ jobs:
 
             // Determine failure reason and build appropriate message
             if (cherryPickStatus === "success" && tscCheckOutcome === "success" && pushOutcome === "success") {
+              const plural = (count, noun) => `${count} ${noun}${Number(count) === 1 ? '' : 's'}`;
               const commitInfo = mergeType === 'Rebase and Merge'
-                ? `${commitCount} commits from PR #${prNumber} have been`
+                ? `${plural(commitCount, 'commit')} from PR #${prNumber} ${Number(commitCount) === 1 ? 'has' : 'have'} been`
                 : `Commit \`${commitHash}\` has been`;
               // Empty picks mean the change was already on the target; say so
               // instead of claiming this run landed it.
               const skipInfo = skippedCount > 0
-                ? `\n\n${skippedCount} of ${commitCount} commit(s) were already present on \`${targetBranch}\` and were skipped.`
+                ? `\n\n${skippedCount} of ${plural(commitCount, 'commit')} ${skippedCount === 1 ? 'was' : 'were'} already present on \`${targetBranch}\` and skipped.`
                 : '';
               comment = pickedCount === 0
                 ? `✅ ${prefix}\n\nNothing to do: the change is already on the \`${targetBranch}\` branch.${mergeInfo}`
