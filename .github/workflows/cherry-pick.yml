@@ -451,14 +451,20 @@ jobs:
           N=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits')
           # refs/pull/N/head outlives the branch (delete-branch-on-merge included),
           # so the PR's own commits are always fetchable. Depth N covers exactly the
-          # PR range; depth N+1 on the tip covers N rebased commits plus the commit
-          # before them, which the walk below must see NOT match.
+          # PR range.
           git fetch --depth="$N" origin "refs/pull/$PR_NUMBER/head:refs/remotes/pr/$PR_NUMBER"
-          git fetch --depth=$((N + 1)) origin "$COMMIT"
 
           PR_KEYS=$(git log --first-parent -n "$N" --format='%ae|%at|%s' "refs/remotes/pr/$PR_NUMBER")
           echo "PR #$PR_NUMBER has $N commit(s):"
           sed 's/^/  /' <<<"$PR_KEYS"
+
+          # Only a rebase tip matches a PR commit. A squash tip stops the walk at its
+          # first step, and the depth-2 fetch above already covers that. So deepen only
+          # for a rebase: N+1 covers the N rebased commits plus the one before them,
+          # which the walk must see NOT match.
+          if grep -qxF -- "$(git log -1 --format='%ae|%at|%s' "$COMMIT")" <<<"$PR_KEYS"; then
+            git fetch --depth=$((N + 1)) origin "$COMMIT"
+          fi
 
           # The walk runs newest→oldest; prepending keeps PICKS oldest-first, the
           # order the commits landed on main and the order they must replay.
