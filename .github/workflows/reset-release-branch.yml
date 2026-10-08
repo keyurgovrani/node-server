@@ -17,8 +17,6 @@ concurrency:
 env:
   RESET_RELEASE: ${{ secrets.PAT }}
   GH_TOKEN: ${{ github.token }}
-  SYNC_APP_ID: ${{ secrets.SYNC_APP_ID }}
-  SYNC_APP_PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
 
 jobs:
   reset:
@@ -100,8 +98,8 @@ jobs:
 
       # Notes are generated, compressed, and size-capped before publishing: a
       # long range would otherwise blow GitHub's 125k body cap and 422. This is
-      # continue-on-error because the reset above is already irreversible — a
-      # notes failure must not skip the ua-knowledge dispatch below. The final
+      # continue-on-error because the reset above is already irreversible, and a
+      # notes failure must still reach the recovery warning below. The final
       # guard step still fails the run.
       - name: Publish release notes
         id: publish_release
@@ -160,47 +158,6 @@ jobs:
             echo "| Tag | \`$TAG\` |"
             echo "| Release | $(gh release view "$TAG" --json url -q .url 2>/dev/null || echo n/a) |"
           } >> "$GITHUB_STEP_SUMMARY" || true
-
-      # Docs: ping ua-knowledge so it regenerates the end-user docs Ask Unify answers
-      # from, against the commit that just became live. ua-knowledge has no cron
-      # fallback, so this dispatch is the ONLY automatic path — but it stays
-      # continue-on-error because a docs ping must never fail a release reset. If it
-      # does not fire, the step below says so loudly in the job summary rather than
-      # letting the docs go stale in silence.
-      - name: Mint GitHub App token (dispatch ua-knowledge)
-        id: ua_knowledge_token
-        if: success() && inputs.target == 'live'
-        continue-on-error: true
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ env.SYNC_APP_ID }}
-          private-key: ${{ env.SYNC_APP_PRIVATE_KEY }}
-          owner: unify-apps
-          repositories: ua-knowledge
-
-      - name: Trigger doc-autogen in ua-knowledge
-        id: ua_knowledge_dispatch
-        if: success() && inputs.target == 'live' && steps.ua_knowledge_token.outputs.token != ''
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.ua_knowledge_token.outputs.token }}
-        run: |
-          set -euo pipefail
-          gh api repos/unify-apps/ua-knowledge/dispatches \
-            -f event_type=www-reset-complete \
-            -F 'client_payload[branch]=live'
-          echo "Dispatched doc-autogen in ua-knowledge (branch: \`live\`)." >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Warn if doc-autogen was not dispatched
-        if: success() && inputs.target == 'live' && steps.ua_knowledge_dispatch.outcome != 'success'
-        run: |
-          {
-            echo ""
-            echo "> [!WARNING]"
-            echo "> **doc-autogen was NOT dispatched** — the Ask Unify docs will not regenerate for this release."
-            echo "> Most likely the \`sync-assets\` GitHub App is not installed on \`unify-apps/ua-knowledge\` with \`Contents: Write\`."
-            echo "> Recover manually: ua-knowledge → Actions → **doc-autogen** → **Run workflow** → \`live\`."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Warn if release notes were not published
         if: steps.reset.outcome == 'success' && steps.publish_release.outcome != 'success'
