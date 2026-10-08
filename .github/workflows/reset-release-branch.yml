@@ -14,6 +14,12 @@ concurrency:
   group: reset-${{ inputs.target }}
   cancel-in-progress: false
 
+env:
+  RESET_RELEASE: ${{ secrets.PAT }}
+  GH_TOKEN: ${{ github.token }}
+  SYNC_APP_ID: ${{ secrets.SYNC_APP_ID }}
+  SYNC_APP_PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
 jobs:
   reset:
     runs-on: ubuntu-latest
@@ -21,9 +27,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # shallow is fine: every push below targets a commit the remote already
+      # has, and the explicit fetch brings SOURCE/TARGET/tags (with the tag
+      # commit objects the creatordate sort needs). No history required.
       - uses: actions/checkout@v5
         with:
-          token: ${{ secrets.PAT }}
+          token: ${{ env.RESET_RELEASE }}
 
       - name: Set up Git config
         run: |
@@ -31,18 +40,15 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
 
-      - name: Backup, tag, release, reset
-        env:
-          GH_TOKEN: ${{ secrets.PAT }}
+      - name: Backup, reset, tag
+        id: reset
         run: |
           set -euo pipefail
           TARGET="${{ inputs.target }}"
           if [[ "$TARGET" == "uat" ]]; then
             SOURCE="main"
-            PRE=(--prerelease)
           else
             SOURCE="uat"
-            PRE=()
           fi
 
           DATE_TAG="$(date '+%d.%m.%y')"
@@ -64,7 +70,7 @@ jobs:
           #    blocks the force-push, no tag/release phantom is left behind)
           git push origin "refs/remotes/origin/${SOURCE}:refs/heads/${TARGET}" --force
 
-          # 3. tag + release the SOURCE (post-reset HEAD); on collision append
+          # 3. tag the SOURCE (post-reset HEAD); on collision append
           #    .01, .02, … (the bare tag is tried first). Tags the source commit,
           #    which the force-push above does not move, so notes are identical
           #    to tagging before the reset — only the failure mode differs.
@@ -84,12 +90,67 @@ jobs:
 
           git tag "$TAG" "refs/remotes/origin/${SOURCE}"
           git push origin "refs/tags/${TAG}"
+
+          {
+            echo "source=$SOURCE"
+            echo "backup=$BACKUP"
+            echo "tag=$TAG"
+            echo "prev_tag=$PREV_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      # Notes are generated, compressed, and size-capped before publishing: a
+      # long range would otherwise blow GitHub's 125k body cap and 422. This is
+      # continue-on-error because the reset above is already irreversible — a
+      # notes failure must not skip the ua-knowledge dispatch below. The final
+      # guard step still fails the run.
+      - name: Publish release notes
+        id: publish_release
+        continue-on-error: true
+        env:
+          TARGET: ${{ inputs.target }}
+          TAG: ${{ steps.reset.outputs.tag }}
+          PREV_TAG: ${{ steps.reset.outputs.prev_tag }}
+          SOURCE: ${{ steps.reset.outputs.source }}
+        run: |
+          set -euo pipefail
+          ASSET="release-notes-${TAG}.md"
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            ${PREV_TAG:+-f previous_tag_name="$PREV_TAG"} \
+            --jq .body \
+            | node scripts/release-notes.mjs --tag "$TAG" --out release-body.md --raw-out "$ASSET"
+
+          # `x && y` as a bare statement returns non-zero when x is false, which
+          # set -e treats as a failure — so this needs a real if, not a one-liner.
+          if [[ "$TARGET" == "uat" ]]; then
+            PRE=(--prerelease)
+          else
+            PRE=()
+          fi
+
+          # written only when the notes were truncated; attach it in the same
+          # create() call so publish either fully succeeds or fully fails.
+          if [[ -f "$ASSET" ]]; then
+            ASSETS=("$ASSET")
+          else
+            ASSETS=()
+          fi
+
           gh release create "$TAG" \
             --title "$TAG reset from $SOURCE" \
-            --generate-notes \
-            ${PREV_TAG:+--notes-start-tag "$PREV_TAG"} \
-            ${PRE[@]+"${PRE[@]}"}
+            --notes-file release-body.md \
+            ${PRE[@]+"${PRE[@]}"} \
+            ${ASSETS[@]+"${ASSETS[@]}"}
 
+      - name: Job summary
+        if: steps.reset.outcome == 'success'
+        env:
+          TARGET: ${{ inputs.target }}
+          SOURCE: ${{ steps.reset.outputs.source }}
+          BACKUP: ${{ steps.reset.outputs.backup }}
+          TAG: ${{ steps.reset.outputs.tag }}
+        run: |
           {
             echo "### Reset $SOURCE → $TARGET"
             echo ""
@@ -97,5 +158,84 @@ jobs:
             echo "|---|---|"
             echo "| Backup branch | \`$BACKUP\` |"
             echo "| Tag | \`$TAG\` |"
-            echo "| Release | $(gh release view "$TAG" --json url -q .url || echo n/a) |"
+            echo "| Release | $(gh release view "$TAG" --json url -q .url 2>/dev/null || echo n/a) |"
           } >> "$GITHUB_STEP_SUMMARY" || true
+
+      # Docs: ping ua-knowledge so it regenerates the end-user docs Ask Unify answers
+      # from, against the commit that just became live. ua-knowledge has no cron
+      # fallback, so this dispatch is the ONLY automatic path — but it stays
+      # continue-on-error because a docs ping must never fail a release reset. If it
+      # does not fire, the step below says so loudly in the job summary rather than
+      # letting the docs go stale in silence.
+      - name: Mint GitHub App token (dispatch ua-knowledge)
+        id: ua_knowledge_token
+        if: success() && inputs.target == 'live'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ env.SYNC_APP_ID }}
+          private-key: ${{ env.SYNC_APP_PRIVATE_KEY }}
+          owner: unify-apps
+          repositories: ua-knowledge
+
+      - name: Trigger doc-autogen in ua-knowledge
+        id: ua_knowledge_dispatch
+        if: success() && inputs.target == 'live' && steps.ua_knowledge_token.outputs.token != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.ua_knowledge_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/unify-apps/ua-knowledge/dispatches \
+            -f event_type=www-reset-complete \
+            -F 'client_payload[branch]=live'
+          echo "Dispatched doc-autogen in ua-knowledge (branch: \`live\`)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn if doc-autogen was not dispatched
+        if: success() && inputs.target == 'live' && steps.ua_knowledge_dispatch.outcome != 'success'
+        run: |
+          {
+            echo ""
+            echo "> [!WARNING]"
+            echo "> **doc-autogen was NOT dispatched** — the Ask Unify docs will not regenerate for this release."
+            echo "> Most likely the \`sync-assets\` GitHub App is not installed on \`unify-apps/ua-knowledge\` with \`Contents: Write\`."
+            echo "> Recover manually: ua-knowledge → Actions → **doc-autogen** → **Run workflow** → \`live\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn if release notes were not published
+        if: steps.reset.outcome == 'success' && steps.publish_release.outcome != 'success'
+        env:
+          TAG: ${{ steps.reset.outputs.tag }}
+          PREV_TAG: ${{ steps.reset.outputs.prev_tag }}
+          SOURCE: ${{ steps.reset.outputs.source }}
+        run: |
+          # mirrors the live call's ${PREV_TAG:+...}: a target's first-ever tag
+          # has no PREV_TAG, and the printed command must omit the flag, not
+          # print it with an empty value the API would reject.
+          PREV_TAG_FLAG="${PREV_TAG:+ -f previous_tag_name=$PREV_TAG}"
+          # mirrors the live call's uat-only --prerelease (:121-122); this step
+          # only has SOURCE in scope, and SOURCE == "main" iff TARGET == "uat".
+          if [[ "$SOURCE" == "main" ]]; then
+            PRERELEASE_FLAG=" --prerelease"
+          else
+            PRERELEASE_FLAG=""
+          fi
+          {
+            echo ""
+            echo "> [!WARNING]"
+            echo "> **Release notes were NOT published** for \`$TAG\` — the branch reset itself succeeded."
+            echo "> If a draft release already exists at \`$TAG\` (e.g. a prior attempt uploaded assets but didn't finish), delete it first: \`gh release delete $TAG\`."
+            echo "> Recover locally:"
+            echo "> \`\`\`bash"
+            echo "> gh api repos/${GITHUB_REPOSITORY}/releases/generate-notes \\"
+            echo ">   -f tag_name=$TAG${PREV_TAG_FLAG} --jq .body \\"
+            echo ">   | node scripts/release-notes.mjs --tag $TAG --out /tmp/body.md --raw-out /tmp/full.md"
+            # \$(...) stays escaped so it runs in the operator's shell against
+            # THEIR /tmp/full.md, not the runner's, when they paste this line.
+            echo "> gh release create $TAG --title \"$TAG reset from $SOURCE\" --notes-file /tmp/body.md${PRERELEASE_FLAG} \$( [[ -f /tmp/full.md ]] && echo /tmp/full.md )"
+            echo "> \`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if release notes were not published
+        if: steps.reset.outcome == 'success' && steps.publish_release.outcome != 'success'
+        run: exit 1
